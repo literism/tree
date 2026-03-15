@@ -1,0 +1,23 @@
+{
+  "path": {
+    "references_file": "/mnt/literism/tree/data/wikipedia_references_final.json",
+    "topic_classified_file": "/mnt/literism/data/result/topic_classified.json",
+    "output_base": "/mnt/literism/tree/hierarchical_output",
+    "base_model": "/home/literism/model/Qwen3-8B"
+  },
+  "inference": {
+    "tensor_parallel_size": 2,
+    "max_model_len": 8192,
+    "gpu_memory_utilization": 0.9,
+    "split": "test",
+    "max_refs": null
+  },
+  "pipeline": {
+    "skip_split": true,
+    "skip_build_records": true,
+    "skip_prepare_dataset": true,
+    "skip_training": true,
+    "only_inference": true
+  }
+}
+

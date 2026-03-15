@@ -1,0 +1,80 @@
+{
+  "path": {
+    "references_file": "/mnt/literism/tree/data/wikipedia_references_final.json",
+    "structures_file": "/mnt/literism/tree/data/wikipedia_structures_final.json",
+    "topic_classified_file": "/mnt/literism/data/result/topic_classified.json",
+    "output_base": "/mnt/literism/tree/hierarchical_output",
+    "base_model": "/home/literism/model/Qwen3-8B"
+  },
+  "data_split": {
+    "test_easy_ratio": 0,
+    "seed": 42
+  },
+  "builder": {
+    "max_depth": 3,
+    "record_mode": true
+  },
+  "dataset_prepare": {
+    "ratio": [1, 3, 1],
+    "seed": 42,
+    "train_size": 30000,
+    "val_ratio": 0.1,
+    "delete_prob": 0.1,
+    "replace_prob": 0.3,
+    "num_constraint_leaves": 10,
+    "type1_single_new_prob": 0.7,
+    "mix_output_to_constraint_prob": 0.1
+  },
+  "lora": {
+    "r": 16,
+    "lora_alpha": 32,
+    "lora_dropout": 0.05,
+    "target_modules": [
+      "q_proj",
+      "k_proj",
+      "v_proj",
+      "o_proj",
+      "gate_proj",
+      "up_proj",
+      "down_proj"
+    ],
+    "bias": "none"
+  },
+  "training": {
+    "num_epochs": 2,
+    "batch_size": 4,
+    "gradient_accumulation_steps": 4,
+    "learning_rate": 2e-4,
+    "warmup_ratio": 0.03,
+    "logging_steps": 50,
+    "save_steps": 300,
+    "eval_steps": 300,
+    "save_total_limit": 3,
+    "max_length": 4096,
+    "bf16": true,
+    "gradient_checkpointing": true,
+    "dataloader_num_workers": 4
+  },
+  "quantization": {
+    "load_in_4bit": false,
+    "bnb_4bit_compute_dtype": "bfloat16",
+    "bnb_4bit_use_double_quant": true,
+    "bnb_4bit_quant_type": "nf4"
+  },
+  "inference": {
+    "tensor_parallel_size": 2,
+    "max_model_len": 8192,
+    "gpu_memory_utilization": 0.9,
+    "split": "test_hard",
+    "max_refs": null,
+    "use_structure_init": true,
+    "num_inference_constraint_leaves": 10
+  },
+  "pipeline": {
+    "skip_split": true,
+    "skip_paraphrases":true,
+    "skip_prepare_dataset": false,
+    "skip_training": true,
+    "only_inference": false
+  }
+}

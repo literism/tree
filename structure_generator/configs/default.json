@@ -1,0 +1,27 @@
+{
+  "wiki_structure_file": "/mnt/literism/data/wiki_dataset/wiki_structure.jsonl",
+  "wiki_intro_file": "/mnt/literism/data/wiki_dataset/wiki_intro.jsonl",
+  "dataset_split_file": "/mnt/literism/tree/hierarchical_output/data/dataset_split.json",
+  "output_base": "/mnt/literism/tree/structure_output",
+  "data_dir": null,
+  "models_dir": null,
+  "inference_dir": null,
+  "base_model": "/home/literism/model/Qwen3-8B",
+  "min_structure_nodes": 10,
+  "min_intro_length": 300,
+  "train_size": 25000,
+  "val_ratio": 0.1,
+  "lora_r": 16,
+  "lora_alpha": 32,
+  "lora_dropout": 0.05,
+  "num_epochs": 3,
+  "batch_size": 2,
+  "gradient_accumulation_steps": 4,
+  "learning_rate": 2e-4,
+  "warmup_ratio": 0.03,
+  "max_length": 4096,
+  "max_new_tokens": 4096,
+  "temperature": 0.7,
+  "top_p": 0.9
+}
+

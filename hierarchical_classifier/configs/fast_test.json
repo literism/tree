@@ -1,0 +1,66 @@
+{
+  "path": {
+    "references_file": "/mnt/literism/tree/data/wikipedia_references_final.json",
+    "topic_classified_file": "/mnt/literism/data/result/topic_classified.json",
+    "output_base": "/mnt/literism/tree/hierarchical_output_test",
+    "base_model": "/home/literism/model/Qwen3-8B"
+  },
+  "data_split": {
+    "val_ratio": 0.1,
+    "seed": 42
+  },
+  "builder": {
+    "max_depth": 5,
+    "record_mode": true
+  },
+  "dataset_prepare": {
+    "ratio": [1, 1, 1],
+    "seed": 42
+  },
+  "lora": {
+    "r": 8,
+    "lora_alpha": 16,
+    "lora_dropout": 0.05,
+    "target_modules": [
+      "q_proj",
+      "v_proj"
+    ],
+    "bias": "none"
+  },
+  "training": {
+    "num_epochs": 1,
+    "batch_size": 1,
+    "gradient_accumulation_steps": 8,
+    "learning_rate": 0.0002,
+    "warmup_ratio": 0.03,
+    "logging_steps": 5,
+    "save_steps": 50,
+    "eval_steps": 50,
+    "save_total_limit": 2,
+    "max_length": 2048,
+    "bf16": true,
+    "gradient_checkpointing": true,
+    "dataloader_num_workers": 2
+  },
+  "quantization": {
+    "load_in_4bit": true,
+    "bnb_4bit_compute_dtype": "bfloat16",
+    "bnb_4bit_use_double_quant": true,
+    "bnb_4bit_quant_type": "nf4"
+  },
+  "inference": {
+    "tensor_parallel_size": 2,
+    "max_model_len": 4096,
+    "gpu_memory_utilization": 0.8,
+    "split": "test",
+    "max_refs": 5
+  },
+  "pipeline": {
+    "skip_split": false,
+    "skip_build_records": false,
+    "skip_prepare_dataset": false,
+    "skip_training": false,
+    "only_inference": false
+  }
+}
+
