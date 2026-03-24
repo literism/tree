@@ -6,6 +6,9 @@ Oracle风格的推理处理器
 import threading
 import time
 import uuid
+import os
+import json
+from pathlib import Path
 from queue import Queue
 from collections import deque
 from tqdm import tqdm
@@ -17,6 +20,7 @@ from summary_based_classifier.models.model_workers import (
 )
 from summary_based_classifier.core.trajectory.trajectory_sampler import TreeNode
 from summary_based_classifier.llm.prompts import PromptTemplates
+from summary_based_classifier.llm.deepseek_api import DeepSeekAPIClient, DeepSeekConfig
 
 
 class OracleStyleInferenceProcessor:
@@ -25,10 +29,12 @@ class OracleStyleInferenceProcessor:
     def __init__(
         self,
         classify_generator_model: str,
-        updater_model: str,
+        updater_model: Optional[str],
         max_depth: int,
         classify_generator_gpu_id: int = 0,
         updater_gpu_id: int = 1,
+        updater_mode: str = "model",
+        updater_api_config: Optional[DeepSeekConfig] = None,
         classifier_batch_size: int = 8,
         updater_batch_size: int = 4,
         classifier_timeout: float = 1.0,
@@ -44,10 +50,12 @@ class OracleStyleInferenceProcessor:
         """
         Args:
             classify_generator_model: 分类生成模型路径
-            updater_model: 总结更新模型路径
+            updater_model: 总结更新模型路径（updater_mode=model时需要）
             max_depth: 最大树深度
             classify_generator_gpu_id: 分类生成模型GPU ID
             updater_gpu_id: 总结更新模型GPU ID
+            updater_mode: 总结模型后端（model/api）
+            updater_api_config: API模式配置（updater_mode=api时需要）
             classifier_batch_size: 分类器批次大小
             updater_batch_size: 更新器批次大小
             classifier_timeout: 分类器批次超时（秒）
@@ -63,6 +71,46 @@ class OracleStyleInferenceProcessor:
         self.max_depth = max_depth
         self.max_workers = max_workers
         self.max_content_length = max_content_length
+        self.updater_mode = updater_mode
+        self.updater_worker = None
+        self.updater_prompt_queue = None
+        self.updater_result_queue = None
+        self.api_updater_client = None
+
+        def _gpu_count(gpu_spec) -> int:
+            s = str(gpu_spec).strip()
+            if not s:
+                return 1
+            if "," in s:
+                return max(1, len([x for x in s.split(",") if x.strip()]))
+            return 1
+
+        def _pick_valid_tp_size(model_path: str, max_tp: int) -> int:
+            """
+            Pick a TP size that is <= max_tp and divides model head counts.
+            This avoids silent worker exits when TP is incompatible (e.g., TP=7).
+            """
+            config_file = Path(model_path) / "config.json"
+            if not config_file.exists():
+                return max_tp
+
+            try:
+                with open(config_file, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+                num_heads = cfg.get("num_attention_heads")
+                num_kv_heads = cfg.get("num_key_value_heads", num_heads)
+                if not isinstance(num_heads, int) or num_heads <= 0:
+                    return max_tp
+                if not isinstance(num_kv_heads, int) or num_kv_heads <= 0:
+                    num_kv_heads = num_heads
+
+                for tp in range(max_tp, 0, -1):
+                    if num_heads % tp == 0 and num_kv_heads % tp == 0:
+                        return tp
+            except Exception:
+                return max_tp
+
+            return 1
         
         # 创建tokenizer
         from transformers import AutoTokenizer
@@ -71,9 +119,10 @@ class OracleStyleInferenceProcessor:
         # 创建multiprocessing队列
         mp_ctx = mp.get_context('spawn')
         self.classifier_prompt_queue = mp_ctx.Queue()
-        self.classifier_result_queue = mp_ctx.Queue()
-        self.updater_prompt_queue = mp_ctx.Queue()
-        self.updater_result_queue = mp_ctx.Queue()
+        self.classifier_result_queue = mp_ctx.Queue()   
+        if self.updater_mode == "model":
+            self.updater_prompt_queue = mp_ctx.Queue()
+            self.updater_result_queue = mp_ctx.Queue()
         
         # 创建Worker进程
         print(f"\n启动Worker进程...")
@@ -82,6 +131,7 @@ class OracleStyleInferenceProcessor:
             prompt_queue=self.classifier_prompt_queue,
             result_queue=self.classifier_result_queue,
             gpu_id=classify_generator_gpu_id,
+            tensor_parallel_size=_gpu_count(classify_generator_gpu_id),
             batch_size=classifier_batch_size,
             timeout=classifier_timeout,
             max_model_len=max_model_len,
@@ -89,20 +139,39 @@ class OracleStyleInferenceProcessor:
             temperature=temperature
         )
         self.classifier_worker.start()
-        
-        self.updater_worker = UpdaterWorker(
-            model_path=updater_model,
-            prompt_queue=self.updater_prompt_queue,
-            result_queue=self.updater_result_queue,
-            gpu_id=updater_gpu_id,
-            batch_size=updater_batch_size,
-            timeout=updater_timeout,
-            max_model_len=max_model_len,
-            gpu_memory_utilization=gpu_memory_utilization,
-            temperature=temperature
-        )
-        self.updater_worker.start()
-        
+
+        if self.updater_mode == "model":
+            if not updater_model:
+                raise ValueError("updater_mode=model 时必须提供 updater_model")
+            updater_gpu_count = _gpu_count(updater_gpu_id)
+            updater_tp_size = _pick_valid_tp_size(updater_model, updater_gpu_count)
+            print(
+                f"  - Updater GPUs: {updater_gpu_id} "
+                f"(count={updater_gpu_count}, tensor_parallel_size={updater_tp_size})"
+            )
+
+            self.updater_worker = UpdaterWorker(
+                model_path=updater_model,
+                prompt_queue=self.updater_prompt_queue,
+                result_queue=self.updater_result_queue,
+                gpu_id=updater_gpu_id,
+                tensor_parallel_size=updater_tp_size,
+                batch_size=updater_batch_size,
+                timeout=updater_timeout,
+                max_model_len=max_model_len,
+                gpu_memory_utilization=gpu_memory_utilization,
+                temperature=temperature
+            )
+            self.updater_worker.start()
+        elif self.updater_mode == "api":
+            if updater_api_config is None:
+                raise ValueError("updater_mode=api 时必须提供 updater_api_config")
+            self.api_updater_client = DeepSeekAPIClient(updater_api_config)
+            self._verify_api_client(self.api_updater_client)
+            print(f"  - Updater backend: API ({updater_api_config.model})")
+        else:
+            raise ValueError(f"不支持的updater_mode: {self.updater_mode}")
+
         print(f"  ✓ Worker进程已启动")
     
     def truncate_text(self, text: str) -> str:
@@ -112,6 +181,71 @@ class OracleStyleInferenceProcessor:
             tokens = tokens[:self.max_content_length]
             text = self.tokenizer.decode(tokens, skip_special_tokens=True)
         return text
+
+    @staticmethod
+    def _apply_thinking_mode(prompt: str) -> str:
+        """为总结模型开启thinking模式（默认开启，可用环境变量关闭）。"""
+        if os.environ.get("SBC_ENABLE_THINKING", "1") == "0":
+            return prompt
+        return (
+            "[Thinking Mode: ON]\n"
+            "First think carefully step by step, then output strictly in the required format.\n\n"
+            f"{prompt}"
+        )
+
+    @staticmethod
+    def _verify_api_client(api_client: DeepSeekAPIClient):
+        """启动时做一次最小API连通性检测，失败则立即报错。"""
+        try:
+            probe_prompt = "Health check. Reply with: OK"
+            results = api_client.run_prompts_to_texts([probe_prompt], show_progress=False)
+            ok = bool(results and isinstance(results[0], str) and results[0].strip())
+            if not ok:
+                raise RuntimeError("API返回为空")
+            print("✓ Updater API连通性检测成功")
+        except Exception as e:
+            raise RuntimeError(f"Updater API客户端初始化失败或不可用: {e}") from e
+
+    def _request_updater_text(self, prompt: str, max_retries: int = 3) -> str:
+        """统一的总结后端调用入口（model/api）。返回原始文本。"""
+        if self.updater_mode == "api":
+            for attempt in range(max_retries):
+                try:
+                    results = self.api_updater_client.run_prompts_to_texts([prompt], show_progress=False)
+                    if results and results[0]:
+                        return results[0]
+                except Exception:
+                    if attempt < max_retries - 1:
+                        time.sleep(1.0)
+                        continue
+                    return ""
+            return ""
+
+        # model模式：通过UpdaterWorker请求
+        for attempt in range(max_retries):
+            try:
+                prompt_id = str(uuid.uuid4())
+                self.updater_prompt_queue.put(PromptRequest(
+                    prompt_id=prompt_id,
+                    prompt=prompt,
+                    context={'n': 1, 'temperature': 0.0}
+                ))
+
+                while True:
+                    result = self.updater_result_queue.get(timeout=600)
+                    if result.prompt_id == prompt_id:
+                        if result.result and len(result.result) > 0:
+                            summary_output = result.result[0]
+                            return summary_output.raw_response if hasattr(summary_output, 'raw_response') else ""
+                        break
+                    self.updater_result_queue.put(result)
+                    time.sleep(0.01)
+            except Exception:
+                if attempt < max_retries - 1:
+                    time.sleep(0.1)
+                    continue
+                return ""
+        return ""
     
     def _classify_article(
         self,
@@ -158,6 +292,9 @@ class OracleStyleInferenceProcessor:
                     if result.result and len(result.result) > 0:
                         return result.result[0]  # ClassificationOutput对象
                     break  # 这次尝试失败，继续重试
+                # 非本请求结果：放回队列，让对应请求线程消费
+                self.classifier_result_queue.put(result)
+                time.sleep(0.01)
             
             # 如果不是最后一次尝试，等待一小段时间再重试
             if attempt < max_retries - 1:
@@ -189,24 +326,23 @@ class OracleStyleInferenceProcessor:
             sibling_summaries=sibling_summaries,
             new_content=article_content
         )
+        prompt = self._apply_thinking_mode(prompt)
         
-        # 生成唯一ID并提交到队列
-        prompt_id = str(uuid.uuid4())
-        self.updater_prompt_queue.put(PromptRequest(
-            prompt_id=prompt_id,
-            prompt=prompt,
-            context={'n': 1, 'temperature': 0.0}
-        ))
-        
-        # 等待结果
-        while True:
-            result = self.updater_result_queue.get()
-            if result.prompt_id == prompt_id:
-                if result.result and len(result.result) > 0:
-                    summary_output = result.result[0]  # SummaryOutput对象
-                    if summary_output.needs_update:
-                        return f"EXPLANATION: {summary_output.explanation}\nSCOPE: {summary_output.scope}"
-                return None
+        response_text = self._request_updater_text(prompt=prompt, max_retries=3)
+        if not response_text:
+            return None
+
+        parsed = PromptTemplates.parse_summary_output(response_text)
+        if not parsed:
+            return None
+        if not parsed.get('needs_update', False):
+            return None
+
+        explanation = parsed.get('explanation', '')
+        scope = parsed.get('scope', '')
+        if explanation and scope:
+            return f"EXPLANATION: {explanation}\nSCOPE: {scope}"
+        return explanation or scope or None
     
     def _merge_summaries(
         self,
@@ -231,24 +367,20 @@ class OracleStyleInferenceProcessor:
             sibling_summaries=[],
             new_content=merge_content
         )
+        prompt = self._apply_thinking_mode(prompt)
         
-        prompt_id = str(uuid.uuid4())
-        self.updater_prompt_queue.put(PromptRequest(
-            prompt_id=prompt_id,
-            prompt=prompt,
-            context={'n': 1, 'temperature': 0.0}
-        ))
-        
-        while True:
-            result = self.updater_result_queue.get()
-            if result.prompt_id == prompt_id:
-                if result.result and len(result.result) > 0:
-                    summary_output = result.result[0]
-                    if summary_output.needs_update and summary_output.scope:
-                        return summary_output.scope
-                
-                # Fallback: 使用第一个子节点的summary
-                return child_summaries[0] if child_summaries else ""
+        response_text = self._request_updater_text(prompt=prompt, max_retries=3)
+        if not response_text:
+            return child_summaries[0] if child_summaries else ""
+
+        parsed = PromptTemplates.parse_summary_output(response_text)
+        if parsed and parsed.get('needs_update', False):
+            scope = parsed.get('scope', '')
+            if scope:
+                return f"SCOPE: {scope}"
+
+        # Fallback: 使用第一个子节点的summary
+        return child_summaries[0] if child_summaries else ""
     
     def _route_article(
         self,
@@ -576,12 +708,16 @@ class OracleStyleInferenceProcessor:
         # 停止Worker进程
         print(f"\n停止Worker进程...")
         self.classifier_worker.stop()
-        self.updater_worker.stop()
+        if self.updater_mode == "model" and self.updater_worker:
+            self.updater_worker.stop()
         
         # 清理资源
         print(f"清理资源...")
-        for queue in [self.classifier_prompt_queue, self.classifier_result_queue,
-                      self.updater_prompt_queue, self.updater_result_queue]:
+        queues = [self.classifier_prompt_queue, self.classifier_result_queue]
+        if self.updater_mode == "model":
+            queues.extend([self.updater_prompt_queue, self.updater_result_queue])
+
+        for queue in queues:
             while not queue.empty():
                 try:
                     queue.get_nowait()

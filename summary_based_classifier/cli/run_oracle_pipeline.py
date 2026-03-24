@@ -10,10 +10,6 @@ Oracle策略完整Pipeline
 """
 import os
 
-os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-os.environ["RAY_memory_monitor_refresh_ms"] = "0"
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
-
 import argparse
 import json
 import subprocess
@@ -80,12 +76,12 @@ def main():
     )
     parser.add_argument(
         '--skip_train_classify', 
-        default=False,
+        default=True,
         help='跳过分类模型训练'
     )
     parser.add_argument(
         '--skip_inference', 
-        default=False,
+        default=True,
         help='跳过推理'
     )
     parser.add_argument(
@@ -99,7 +95,7 @@ def main():
     parser.add_argument(
         '--data_mode',
         type=str,
-        default='model',
+        default='api',
         choices=['api', 'model'],
         help='数据生成模式：api或model（默认model）'
     )
@@ -177,6 +173,31 @@ def main():
         type=str,
         default=None,
         help='推理时使用的总结模型路径（默认自动查找训练好的模型）'
+    )
+    parser.add_argument(
+        '--inference_updater_mode',
+        type=str,
+        default='model',
+        choices=['model', 'api'],
+        help='推理时总结后端：model或api'
+    )
+    parser.add_argument(
+        '--inference_api_key',
+        type=str,
+        default='',
+        help='推理API Key（inference_updater_mode=api时需要）'
+    )
+    parser.add_argument(
+        '--inference_api_url',
+        type=str,
+        default='https://api.deepseek.com',
+        help='推理API Base URL（inference_updater_mode=api）'
+    )
+    parser.add_argument(
+        '--inference_api_model',
+        type=str,
+        default='deepseek-chat',
+        help='推理API模型名（inference_updater_mode=api）'
     )
     parser.add_argument(
         '--inference_max_workers',
@@ -451,40 +472,61 @@ def main():
             print(f"\n错误: 分类模型不存在: {classify_model}")
             sys.exit(1)
         
-        # 确定总结模型路径
-        if args.updater_model:
-            updater_model = args.updater_model
+        # 确定总结后端与模型路径
+        updater_model = None
+        if args.inference_updater_mode == 'model':
+            if args.updater_model:
+                updater_model = args.updater_model
+            else:
+                updater_model = str(config.path.base_model)
+            if not Path(updater_model).exists():
+                print(f"\n错误: 总结模型不存在: {updater_model}")
+                sys.exit(1)
         else:
-            updater_model = str(config.path.base_model)
-        
-        if not Path(updater_model).exists():
-            print(f"\n错误: 总结模型不存在: {updater_model}")
-            sys.exit(1)
+            if not args.inference_api_key:
+                print("\n错误: inference_updater_mode=api 时必须提供 --inference_api_key")
+                sys.exit(1)
         
         # 解析GPU配置
-        gpu_list = args.inference_gpus.split(',')
-        if len(gpu_list) < 2:
-            print(f"\n警告: 只有{len(gpu_list)}个GPU，分类模型和总结模型将共享GPU")
-            classify_gpu = int(gpu_list[0].strip())
-            updater_gpu = int(gpu_list[0].strip())
+        gpu_list = [g.strip() for g in args.inference_gpus.split(',') if g.strip()]
+        if not gpu_list:
+            gpu_list = ['0']
+        if len(gpu_list) == 1:
+            print(f"\n警告: 只有1个GPU，分类模型和总结模型将共享GPU")
+            classify_gpu = gpu_list[0]
+            updater_gpu = gpu_list[0]
         else:
-            classify_gpu = int(gpu_list[0].strip())
-            updater_gpu = int(gpu_list[1].strip())
+            if args.inference_updater_mode == 'api':
+                # API总结后端不占本地GPU，分类模型自动使用全部GPU
+                classify_gpu = ",".join(gpu_list)
+                updater_gpu = gpu_list[0]
+            else:
+                classify_gpu = gpu_list[0]
+                # model总结后端使用剩余所有GPU做TP
+                updater_gpu = ",".join(gpu_list[1:])
         
         print(f"\nGPU分配:")
         print(f"  - 分类模型GPU: {classify_gpu}")
-        print(f"  - 总结模型GPU: {updater_gpu}")
+        print(f"  - 总结模型GPU: {updater_gpu} (mode={args.inference_updater_mode})")
         
         cmd = [
             sys.executable, '-m', 'summary_based_classifier.inference.inference_oracle_style',
             '--config', config_path,
             '--classify_generator_model', classify_model,
-            '--updater_model', updater_model,
+            '--updater_mode', args.inference_updater_mode,
             '--split', args.inference_split,
             '--classify_gpu', str(classify_gpu),
             '--updater_gpu', str(updater_gpu),
             '--max_workers', str(args.inference_max_workers)
         ]
+        if args.inference_updater_mode == 'model':
+            cmd.extend(['--updater_model', updater_model])
+        else:
+            cmd.extend([
+                '--updater_api_key', args.inference_api_key,
+                '--updater_api_url', args.inference_api_url,
+                '--updater_api_model', args.inference_api_model,
+            ])
         
         if args.max_refs_per_topic:
             cmd.extend(['--max_refs', str(args.max_refs_per_topic)])

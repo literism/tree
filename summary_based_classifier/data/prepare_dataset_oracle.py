@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import re
 import multiprocessing as mp
@@ -140,8 +141,9 @@ class OracleSFTGenerator:
     - 直接用策略π决定归拢（不延迟）
     - 节点特征=纯summary（API或模型生成）
     - 支持两种模式：
-      * api: 使用API生成summary，记录分类和总结两类数据
-      * model: 使用训练好的模型生成summary，只记录分类数据
+      * api: 使用线上API生成summary/补全
+      * model: 使用本地模型Worker生成summary/补全
+    两种模式除调用后端不同外，其余数据构建与记录逻辑保持一致。
     """
     
     def __init__(
@@ -156,8 +158,11 @@ class OracleSFTGenerator:
         self.mode = mode
         
         if mode == "api":
+            if api_config is None:
+                raise ValueError("mode=api 时必须提供 api_config")
             # 创建DeepSeek API客户端
             self.api_client = DeepSeekAPIClient(api_config)
+            self._verify_api_client(self.api_client)
             print("✓ DeepSeek API客户端已创建（API模式）")
         elif mode == "model":
             # 创建模型Worker（稍后初始化）
@@ -195,6 +200,19 @@ class OracleSFTGenerator:
         # Prompt模板
         self.prompt_templates = PromptTemplates()
 
+    @staticmethod
+    def _verify_api_client(api_client: DeepSeekAPIClient):
+        """启动时做一次最小API连通性检测，失败则立即报错。"""
+        try:
+            probe_prompt = "Health check. Reply with: OK"
+            results = api_client.run_prompts_to_texts([probe_prompt], show_progress=False)
+            ok = bool(results and isinstance(results[0], str) and results[0].strip())
+            if not ok:
+                raise RuntimeError("API返回为空")
+            print(f"✓ API连通性检测成功")
+        except Exception as e:
+            raise RuntimeError(f"API客户端初始化失败或不可用: {e}") from e
+
     def _extract_article_relevant_content(self, completion_text: str) -> Dict:
         """从模型输出中提取 ARTICLE RELEVANT_CONTENT 字典。"""
         if not isinstance(completion_text, str):
@@ -203,17 +221,20 @@ class OracleSFTGenerator:
         if not text:
             return {}
 
-        # 优先解析 "ARTICLE RELEVANT_CONTENT: {...}" 这一行
-        for ln in text.splitlines():
-            line = ln.strip()
-            if line.upper().startswith("ARTICLE RELEVANT_CONTENT:"):
-                raw = line.split(":", 1)[1].strip()
-                try:
-                    obj = json.loads(raw)
-                    if isinstance(obj, dict):
-                        return obj
-                except Exception:
-                    pass
+        # 优先解析 label 后的JSON（支持多行JSON）
+        up = text.upper()
+        pos = up.find("ARTICLE RELEVANT_CONTENT:")
+        if pos != -1:
+            colon = text.find(":", pos)
+            if colon != -1:
+                remainder = text[colon + 1:].lstrip()
+                if remainder:
+                    try:
+                        obj, _end = json.JSONDecoder().raw_decode(remainder)
+                        if isinstance(obj, dict):
+                            return obj
+                    except Exception:
+                        pass
 
         # 回退：提取第一个JSON对象
         m = re.search(r"\{[\s\S]*?\}", text)
@@ -225,6 +246,20 @@ class OracleSFTGenerator:
             except Exception:
                 return {}
         return {}
+
+    @staticmethod
+    def _apply_thinking_mode(prompt: str) -> str:
+        """
+        为总结/补全模型开启thinking模式（可通过环境变量关闭）。
+        默认开启：SBC_ENABLE_THINKING!=0
+        """
+        if os.environ.get("SBC_ENABLE_THINKING", "1") == "0":
+            return prompt
+        return (
+            "[Thinking Mode: ON]\n"
+            "First think carefully step by step, then output strictly in the required format.\n\n"
+            f"{prompt}"
+        )
 
     def _build_classification_completion_with_reasoning(
         self,
@@ -243,7 +278,7 @@ class OracleSFTGenerator:
             need_new=need_new,
             merge_with=valid_merge,
         )
-        completion_from_model = self.generate_summary(reasoning_prompt)
+        completion_from_model = self.generate_classification_completion(reasoning_prompt)
         relevant_content = self._extract_article_relevant_content(completion_from_model)
 
         return self.prompt_templates.format_classification_completion(
@@ -253,6 +288,65 @@ class OracleSFTGenerator:
             merge_with=valid_merge,
             relevant_content=relevant_content,
         )
+
+    def generate_classification_completion(self, prompt: str, max_retries: int = 3) -> str:
+        """
+        专用于“分类completion补全”的模型调用。
+        注意：不走总结解析逻辑，只返回模型原始文本，避免影响summary生成/更新主流程。
+        """
+        prompt = self._apply_thinking_mode(prompt)
+
+        if self.mode == "api":
+            for attempt in range(max_retries):
+                try:
+                    results = self.api_client.run_prompts_to_texts([prompt], show_progress=False)
+                    if results and results[0]:
+                        return results[0]
+                except Exception:
+                    if attempt < max_retries - 1:
+                        import time
+                        time.sleep(1)
+                        continue
+                    return ""
+            return ""
+
+        elif self.mode == "model":
+            import uuid
+            from summary_based_classifier.models.model_workers import PromptRequest
+
+            for attempt in range(max_retries):
+                try:
+                    prompt_id = str(uuid.uuid4())
+                    self.updater_prompt_queue.put(PromptRequest(
+                        prompt_id=prompt_id,
+                        prompt=prompt,
+                        context={
+                            'task': 'classification_completion',
+                            'n': 1,
+                            'temperature': 0.0,
+                            'max_tokens': 2048,
+                        }
+                    ))
+
+                    while True:
+                        result = self.updater_result_queue.get(timeout=600)
+                        if result.prompt_id == prompt_id:
+                            if result.result and len(result.result) > 0:
+                                completion_output = result.result[0]
+                                return completion_output.raw_response if hasattr(completion_output, 'raw_response') else ""
+                            break
+                        self.updater_result_queue.put(result)
+                        import time
+                        time.sleep(0.01)
+                except Exception:
+                    if attempt < max_retries - 1:
+                        import time
+                        time.sleep(0.1)
+                        continue
+                    return ""
+            return ""
+
+        return ""
     
     def truncate_text(self, text: str, max_tokens: int = None) -> str:
         """根据token数截断文本"""
@@ -273,6 +367,8 @@ class OracleSFTGenerator:
         """
         生成summary（根据模式调用API或模型，带重试）
         """
+        prompt = self._apply_thinking_mode(prompt)
+
         if self.mode == "api":
             for attempt in range(max_retries):
                 try:
@@ -312,6 +408,10 @@ class OracleSFTGenerator:
                                 # 返回原始response文本
                                 return summary_output.raw_response if hasattr(summary_output, 'raw_response') else ""
                             break
+                        # 不是本请求的结果：放回队列，让对应请求线程消费
+                        self.updater_result_queue.put(result)
+                        import time
+                        time.sleep(0.01)
                 except Exception as e:
                     if attempt < max_retries - 1:
                         import time
@@ -377,25 +477,24 @@ class OracleSFTGenerator:
             
             if parsed:
                 needs_update = parsed.get('needs_update', False)
-                
-                # 记录训练数据（仅在API模式下）
-                if self.mode == "api":
-                    sample = SummaryGenerationSample(
-                        prompt=base_prompt,
-                        completion=response,
-                        topic=topic,
-                        article_idx=article_idx,
-                        node_id=str(id(current_node)),
-                        operation="update"
-                    )
-                    
-                    with self.samples_lock:
-                        self.summary_samples.append(sample)
-                        # 更新进度条
-                        if self.progress_bar:
-                            with self.progress_lock:
-                                self.progress_bar.update(1)
-                
+
+                # 记录训练数据（API/Model统一记录）
+                sample = SummaryGenerationSample(
+                    prompt=base_prompt,
+                    completion=response,
+                    topic=topic,
+                    article_idx=article_idx,
+                    node_id=str(id(current_node)),
+                    operation="update"
+                )
+
+                with self.samples_lock:
+                    self.summary_samples.append(sample)
+                    # 更新进度条
+                    if self.progress_bar:
+                        with self.progress_lock:
+                            self.progress_bar.update(1)
+
                 if needs_update:
                     # 需要更新
                     explanation = parsed.get('explanation', '')
@@ -451,7 +550,7 @@ class OracleSFTGenerator:
         
         # 在生成数据时，额外添加guidance给API（不记录到训练数据中）
         target_label = getattr(node, 'target_label', None) if is_new_node else None
-        if target_label and self.mode == "api":
+        if target_label:
             # 提取target_label的最后部分作为引导
             guidance_text = f"\n\n**Guidance**: The correct classification path for the current node is {target_label}, and the summary you output should align closely with it."
             prompt_with_guidance = base_prompt + guidance_text
@@ -476,23 +575,22 @@ class OracleSFTGenerator:
         if parsed:
             needs_update = parsed.get('needs_update', False)
             
-            # 记录summary训练数据（仅在API模式下）
-            if self.mode == "api":
-                sample = SummaryGenerationSample(
-                    prompt=base_prompt,  # 使用不带guidance的基础prompt
-                    completion=response,  # 保存原始输出，包含NEEDS_UPDATE等信息
-                    topic=topic,
-                    article_idx=article_idx,
-                    node_id=str(id(node)),
-                    operation=operation
-                )
-                
-                with self.samples_lock:
-                    self.summary_samples.append(sample)
-                    # 更新进度条
-                    if self.progress_bar:
-                        with self.progress_lock:
-                            self.progress_bar.update(1)
+            # 记录summary训练数据（API/Model统一记录）
+            sample = SummaryGenerationSample(
+                prompt=base_prompt,  # 使用不带guidance的基础prompt
+                completion=response,  # 保存原始输出，包含NEEDS_UPDATE等信息
+                topic=topic,
+                article_idx=article_idx,
+                node_id=str(id(node)),
+                operation=operation
+            )
+            
+            with self.samples_lock:
+                self.summary_samples.append(sample)
+                # 更新进度条
+                if self.progress_bar:
+                    with self.progress_lock:
+                        self.progress_bar.update(1)
             
             # 对于新节点，强制更新（不检查needs_update）
             if is_new_node or needs_update:
@@ -558,7 +656,7 @@ class OracleSFTGenerator:
         
         # 在生成数据时，额外添加guidance给API（不记录到训练数据中）
         target_label = getattr(parent_node, 'target_label', None)
-        if target_label and self.mode == "api":
+        if target_label:
             label_parts = target_label.split(" - ")
             current_label = label_parts[-1] if label_parts else target_label
             guidance_text = f"\n\n**Guidance**: The correct classification path for the current node is {target_label}, and the summary you output should align closely with it."
@@ -580,23 +678,22 @@ class OracleSFTGenerator:
         if parsed:
             needs_update = parsed.get('needs_update', False)
             
-            # 记录训练数据（仅在API模式下）
-            if self.mode == "api":
-                sample = SummaryGenerationSample(
-                    prompt=base_prompt,  # 使用不带guidance的基础prompt
-                    completion=response,
-                    topic=topic,
-                    article_idx=article_idx,
-                    node_id="merge",
-                    operation="merge"
-                )
-                
-                with self.samples_lock:
-                    self.summary_samples.append(sample)
-                    # 更新进度条
-                    if self.progress_bar:
-                        with self.progress_lock:
-                            self.progress_bar.update(1)
+            # 记录训练数据（API/Model统一记录）
+            sample = SummaryGenerationSample(
+                prompt=base_prompt,  # 使用不带guidance的基础prompt
+                completion=response,
+                topic=topic,
+                article_idx=article_idx,
+                node_id="merge",
+                operation="merge"
+            )
+            
+            with self.samples_lock:
+                self.summary_samples.append(sample)
+                # 更新进度条
+                if self.progress_bar:
+                    with self.progress_lock:
+                        self.progress_bar.update(1)
             
             if needs_update:
                 # 需要更新
@@ -1077,12 +1174,8 @@ class OracleSFTGenerator:
         # 创建全局进度条（显示生成的数据条数）
         if max_samples_per_type:
             # 如果设置了目标样本数，使用目标值作为total
-            # API模式：分类 + Summary各一份
-            # Model模式：只有分类数据
-            if self.mode == "api":
-                total_target = max_samples_per_type * 2
-            else:
-                total_target = max_samples_per_type
+            # 分类 + Summary 各一份（API/Model保持一致）
+            total_target = max_samples_per_type * 2
             
             self.progress_bar = tqdm(
                 total=total_target,
@@ -1126,22 +1219,19 @@ class OracleSFTGenerator:
                         tqdm.write(f"✓ {result.get('topic_name', topic_key)}: "
                                    f"分类样本={cls_count}, Summary样本={sum_count}")
                         
-                        # 检查是否达到目标样本数（根据模式不同）
+                        # 检查是否达到目标样本数（API/Model保持一致）
                         should_stop = False
                         if max_samples_per_type:
-                            if self.mode == "api":
-                                # API模式：需要同时达到分类和Summary的目标数
-                                should_stop = cls_count >= max_samples_per_type and sum_count >= max_samples_per_type
-                            else:
-                                # Model模式：只需要达到分类的目标数
-                                should_stop = cls_count >= max_samples_per_type
+                            should_stop = (
+                                cls_count >= max_samples_per_type
+                                and sum_count >= max_samples_per_type
+                            )
                         
                         if should_stop:
                             tqdm.write(f"\n{'='*80}")
                             tqdm.write(f"✓ 已达到目标样本数！提前退出。")
                             tqdm.write(f"  - 分类样本: {cls_count}/{max_samples_per_type}")
-                            if self.mode == "api":
-                                tqdm.write(f"  - Summary样本: {sum_count}/{max_samples_per_type}")
+                            tqdm.write(f"  - Summary样本: {sum_count}/{max_samples_per_type}")
                             tqdm.write(f"{'='*80}\n")
                             self.progress_bar.close()
                             
@@ -1265,7 +1355,7 @@ def main():
     # 模型模式参数
     parser.add_argument('--summary_model_path', type=str, default=None, help='总结模型路径（模型模式，默认使用config中的base_model）')
     parser.add_argument('--updater_gpu', type=int, default=1, help='总结模型使用的GPU ID（模型模式，兼容旧参数）')
-    parser.add_argument('--updater_gpus', type=str, default='0,1', help='总结模型使用的GPU列表（模型模式，如0,1）')
+    parser.add_argument('--updater_gpus', type=str, default='0,1,2,3,4,5,6,7', help='总结模型使用的GPU列表（模型模式，如0,1）')
     
     # 通用参数
     parser.add_argument('--max_topics', type=int, default=None, help='最多处理的topic数量')

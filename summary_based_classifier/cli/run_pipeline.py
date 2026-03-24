@@ -14,9 +14,6 @@
 """
 import os
 
-os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-os.environ["RAY_memory_monitor_refresh_ms"] = "0"
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
 import argparse
 import subprocess
 import sys

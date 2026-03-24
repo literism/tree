@@ -8,18 +8,25 @@ import argparse
 from pathlib import Path
 from summary_based_classifier.config import SummaryBasedConfig
 from summary_based_classifier.inference.oracle_style_inference_processor import OracleStyleInferenceProcessor
+from summary_based_classifier.llm.deepseek_api import DeepSeekConfig
 
 
 def main():
     parser = argparse.ArgumentParser(description='Oracle风格推理（使用训练好的模型）')
     parser.add_argument('--config', type=str, default='./configs/default.json')
     parser.add_argument('--classify_generator_model', type=str, required=True, help='分类生成模型路径')
-    parser.add_argument('--updater_model', type=str, required=True, help='总结更新模型路径')
+    parser.add_argument('--updater_model', type=str, default=None, help='总结更新模型路径（updater_mode=model时需要）')
+    parser.add_argument('--updater_mode', type=str, default='model', choices=['model', 'api'], help='总结后端：model或api')
+    parser.add_argument('--updater_api_key', type=str, default="", help='API Key（updater_mode=api时需要）')
+    parser.add_argument('--updater_api_url', type=str, default='https://api.deepseek.com', help='API Base URL（updater_mode=api）')
+    parser.add_argument('--updater_api_model', type=str, default='deepseek-chat', help='API模型名（updater_mode=api）')
+    parser.add_argument('--updater_api_max_output_tokens', type=int, default=2048, help='API最大输出tokens')
+    parser.add_argument('--updater_api_max_concurrent_jobs', type=int, default=8, help='API并发数')
     parser.add_argument('--split', type=str, default='test', help='推理的数据划分')
     parser.add_argument('--max_refs', type=int, default=None, help='每个topic最多处理的文章数')
     parser.add_argument('--max_workers', type=int, default=4, help='最大并行topic数')
-    parser.add_argument('--classify_gpu', type=int, default=0, help='分类模型使用的GPU')
-    parser.add_argument('--updater_gpu', type=int, default=1, help='总结模型使用的GPU')
+    parser.add_argument('--classify_gpu', type=str, default='0', help='分类模型使用的GPU，可为单卡ID')
+    parser.add_argument('--updater_gpu', type=str, default='1', help='总结模型使用的GPU，可为逗号分隔多卡ID')
     
     args = parser.parse_args()
     
@@ -31,7 +38,8 @@ def main():
     print("="*80)
     print(f"配置文件: {args.config}")
     print(f"分类模型: {args.classify_generator_model}")
-    print(f"总结模型: {args.updater_model}")
+    print(f"总结后端: {args.updater_mode}")
+    print(f"总结模型: {args.updater_model if args.updater_mode == 'model' else args.updater_api_model}")
     print(f"数据划分: {args.split}")
     print(f"GPU配置: 分类模型GPU={args.classify_gpu}, 总结模型GPU={args.updater_gpu}")
     print(f"最大并行数: {args.max_workers}")
@@ -90,12 +98,29 @@ def main():
         # 使用base_model作为tokenizer
         tokenizer_name = config.path.base_model
     
+    updater_api_config = None
+    if args.updater_mode == "api":
+        if not args.updater_api_key:
+            raise ValueError("updater_mode=api 时必须提供 --updater_api_key")
+        updater_api_config = DeepSeekConfig(
+            api_key=args.updater_api_key,
+            base_url=args.updater_api_url,
+            model=args.updater_api_model,
+            temperature=config.inference.temperature,
+            max_output_tokens=args.updater_api_max_output_tokens,
+            max_concurrent_jobs=args.updater_api_max_concurrent_jobs,
+        )
+    elif not args.updater_model:
+        raise ValueError("updater_mode=model 时必须提供 --updater_model")
+
     processor = OracleStyleInferenceProcessor(
         classify_generator_model=args.classify_generator_model,
         updater_model=args.updater_model,
         max_depth=config.inference.max_depth,
         classify_generator_gpu_id=args.classify_gpu,
         updater_gpu_id=args.updater_gpu,
+        updater_mode=args.updater_mode,
+        updater_api_config=updater_api_config,
         classifier_batch_size=getattr(config.inference, 'classifier_batch_size', 32),
         updater_batch_size=getattr(config.inference, 'updater_batch_size', 32),
         classifier_timeout=getattr(config.inference, 'classifier_timeout', 0.1),

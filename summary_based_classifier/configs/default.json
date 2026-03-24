@@ -1,10 +1,10 @@
 {
   "path": {
-    "structures_file": "/mnt/literism/tree/data/wikipedia_structures_final.json",
-    "references_file": "/mnt/literism/tree/data/wikipedia_references_final.json",
-    "output_base": "/mnt/literism/tree/summary_output",
-    "data_dir": "/mnt/literism/tree/summary_output/data",
-    "base_model": "/home/literism/model/Qwen3-32B"
+    "structures_file": "/ossfs/workspace/tree/data/tree/data/wikipedia_structures_final.json",
+    "references_file": "/ossfs/workspace/tree/data/wikipedia_references_final.json",
+    "output_base": "/ossfs/workspace/tree/data/",
+    "data_dir": "/ossfs/workspace/tree/data/",
+    "base_model": "/home/admin/Qwen3-32B"
   },
   "data_split": {
     "target_test_size": 250,

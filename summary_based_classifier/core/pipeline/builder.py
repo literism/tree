@@ -64,6 +64,9 @@ class TreeBuilder:
         self.updater_prompt_queue = None
         self.updater_result_queue = None
         self._prompt_counter = 0
+        # 共享result_queue时，按prompt_id缓存错取结果，避免丢包
+        self._pending_classifier_results = {}
+        self._pending_updater_results = {}
         
         # 文章内容缓存（用于重新路由）
         self.articles_cache = {}
@@ -134,6 +137,10 @@ class TreeBuilder:
                 prompt_id=prompt_id,
                 prompt=prompt
             ))
+
+            cached = self._pending_classifier_results.pop(prompt_id, None)
+            if cached is not None:
+                return cached.result[:n] if cached.result else []
             
             # 等待结果
             while True:
@@ -142,6 +149,8 @@ class TreeBuilder:
                     if result.prompt_id == prompt_id:
                         # result.result 已经是 ClassificationOutput 对象列表
                         return result.result[:n]
+                    # 非本请求结果，缓存供对应调用读取
+                    self._pending_classifier_results[result.prompt_id] = result
                 except:
                     return []
         else:
@@ -167,6 +176,10 @@ class TreeBuilder:
                 prompt_id=prompt_id,
                 prompt=prompt
             ))
+
+            cached = self._pending_updater_results.pop(prompt_id, None)
+            if cached is not None:
+                return cached.result[:n] if cached.result else []
             
             # 等待结果
             while True:
@@ -175,6 +188,8 @@ class TreeBuilder:
                     if result.prompt_id == prompt_id:
                         # result.result 已经是 SummaryOutput 对象列表
                         return result.result[:n]
+                    # 非本请求结果，缓存供对应调用读取
+                    self._pending_updater_results[result.prompt_id] = result
                 except:
                     return []
         else:
@@ -351,7 +366,7 @@ class TreeBuilder:
                     all_paths.append(new_path)
                 else:
                     # 否则继续递归
-                self._classify_recursive(next_node, article_id, article_content, new_path, all_paths)
+                    self._classify_recursive(next_node, article_id, article_content, new_path, all_paths)
         
         # 处理NEW
         if action.need_new:
@@ -378,7 +393,7 @@ class TreeBuilder:
                         # 路径包含新插入的父节点
                         new_path = path + [inserted_parent, new_node]
                 else:
-                new_path = path + [new_node]
+                    new_path = path + [new_node]
                 
                 # 创建新叶子后流程结束，记录路径
                 all_paths.append(new_path)

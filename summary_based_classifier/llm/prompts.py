@@ -17,36 +17,45 @@ class PromptTemplates:
 
 **Your Task**: Follow the reasoning steps below to decide classification actions.
 
-** Step 1: Extract Article Relevant Content  
-- Identify key themes from the article that indicate classification intent.  
-- Output as a dictionary with numbered keys.  
-- For each excerpt, show ONLY the first few words and last few words, separated by "...".  
-- Merge related ideas; avoid fragmentation.  
-- Each entry must represent a distinct thematic unit (e.g., topic, focus, scope).  
-- Example: {{"0": "Chronicles: Art & Design ... film adaptation", "1": "concept art by Alan Lee ... Weta Workshop"}}
+** Step 1: Summarize Parent-Relevant Content  
+- Summarize the parts of the article that are relevant to the Current Node Summary.  
+- Do NOT quote long excerpts. Use concise semantic summaries.  
+- Keep focus on classification-relevant information (theme, scope, focus, intent).  
 
-** Step 2: Match Against Existing Categories Using Step 1  
-- Review each item in Step 1's output.  
-- Determine whether it overlaps significantly with any existing child category.  
-- Justify briefly for each match (or non-match).  
-- Final output: List of indices where >0 excerpt from Step 1 clearly belongs.  
+** Step 2: Decompose into Overlap vs Residual  
+- Compare Step 1 summary with each Existing Child Category.  
+- Identify:
+  1) content overlapping with existing child categories, and  
+  2) residual content not covered by any child category.  
+- Keep this step explicit and category-aware.
+- There are several categories for Existing Child, so in CHILD_OVERLAP_ANALYSIS, several categories need to be output.
+- If there are NO Existing Child Categories, set CHILD_OVERLAP_ANALYSIS = {{}}
+
+** Step 3: Decide Matched Categories  
+- Use the overlap analysis from Step 2.  
+- Output indices of child categories with clear semantic overlap.  
 - If none: output []
 
-** Step 3: Assess Need for New Category Based on Unmatched Content  
-- Consider only the excerpts in Step 1 that were NOT covered by existing categories.  
-- Ask: Does this residual content form a coherent, specific theme not currently represented?  
-- If yes -> NEED_NEW = true  
-- If no (general/redundant) -> NEED_NEW = false
+** Step 4: Decide NEED_NEW from Residual  
+- Use only residual (non-overlapping) content from Step 2.  
+- If residual forms a coherent and specific uncovered theme -> NEED_NEW = true  
+- Otherwise -> NEED_NEW = false
 
-** Step 4: Assess Need for Merge  
-- Evaluate whether any two existing categories are semantically redundant given the full context.  
-- Output: single index to merge into, or null
+** Step 5: Assess Need for Merge  
+- Evaluate whether a newly created category (if any) should be merged with one existing child category.  
+- Output: single index to merge into, or null.
 
 **Output Format** (STRICT):
-ARTICLE RELEVANT_CONTENT: {{dictionary from Step 1}}
-MATCHED_CATEGORIES: [list from Step 2]
-NEED_NEW: [true/false from Step 3]
-MERGE_WITH: [int/null from Step 4]
+ARTICLE RELEVANT_CONTENT: {{
+  "PARENT_RELEVANT_SUMMARY": "string",
+  "CHILD_OVERLAP_ANALYSIS": {{
+    "Category i": "overlap summary or none"
+  }},
+  "RESIDUAL_NOVEL_POINTS": ["point1", "point2"]
+}}
+MATCHED_CATEGORIES: [list from Step 3]
+NEED_NEW: [true/false from Step 4]
+MERGE_WITH: [int/null from Step 5]
 
 ## Input Content for Processing:
 **Topic**: {topic_name}
@@ -308,33 +317,41 @@ Now classify the article:
         merge_with: Optional[int],
     ) -> str:
         """构造“基于Oracle结果补充推理”的数据生成prompt"""
-        return f"""You are reconstructing missing training data for a hierarchical classifier. Your task is to generate the missing Step 1 output ("ARTICLE RELEVANT_CONTENT") that logically leads to the given final decisions.
+        return f"""You are reconstructing missing training data for a hierarchical classifier. Your task is to generate only the missing "ARTICLE RELEVANT_CONTENT" dictionary that is logically consistent with the given Oracle final decisions.
 
-**Important**: 
-- Do NOT output reasoning.
-- Do NOT modify or reformat the final JSON.
-- The only thing you may generate is the "ARTICLE RELEVANT_CONTENT" dictionary.
+**Important**:
+- Do NOT output chain-of-thought.
+- Do NOT output MATCHED_CATEGORIES / NEED_NEW / MERGE_WITH.
+- Do NOT output any extra text.
+- Output ONLY one dictionary for ARTICLE RELEVANT_CONTENT.
 
-**Rules for Reconstruction**:
-1. Analyze the article and the final decisions to infer what key themes must have been extracted in Step 1.
-2. Each theme should be a coherent idea relevant to classification (e.g., topic, focus, scope).
-3. Format each as: "X": "first few words ... last few words"
-   - Show only beginning and end of phrase, with "..." in between.
-   - Total visible words (before/after "...") < 10.
-   - Merge related ideas; avoid fragmentation.
-4. Ensure the set explains:
-   - Why certain categories were matched (or not)
-   - Why a new category was needed (if YES)
-   - Why no merge occurred (or which one was chosen)
-5. The result must be sufficient and necessary to support the downstream outputs.
+**Target Dictionary Schema**:
+{{
+  "PARENT_RELEVANT_SUMMARY": "string",
+  "CHILD_OVERLAP_ANALYSIS": {{
+    "Category i": "overlap summary or none"
+  }},
+  "RESIDUAL_NOVEL_POINTS": ["point1", "point2"]
+}}
+
+**Answer-Guided Constraints (MUST satisfy)**:
+1. The dictionary must support EXACTLY these Oracle outputs:
+   - MATCHED_CATEGORIES: {json.dumps(sorted(set(matched_categories)), ensure_ascii=False)}
+   - NEED_NEW: {"true" if bool(need_new) else "false"}
+   - MERGE_WITH: {"null" if merge_with is None else merge_with}
+2. CHILD_OVERLAP_ANALYSIS:
+   - Categories in MATCHED_CATEGORIES must have clear overlap evidence.
+   - Categories NOT in MATCHED_CATEGORIES should be weak overlap or none.
+   - If there are no existing child categories in the classification prompt, this field must be {{}}.
+3. RESIDUAL_NOVEL_POINTS:
+   - If NEED_NEW = true, include concrete residual points not covered by matched categories.
+   - If NEED_NEW = false, residual points should be empty or clearly non-decisive.
+4. Keep content concise, semantic, and classification-oriented (no long quoted excerpts).
 
 Classification task prompt:
+==================================
 {classification_prompt}
-
-Oracle final outputs (MUST be preserved in logic):
-MATCHED_CATEGORIES: {json.dumps(sorted(set(matched_categories)), ensure_ascii=False)}
-NEED_NEW: {"true" if bool(need_new) else "false"}
-MERGE_WITH: {"null" if merge_with is None else merge_with}
+==================================
 
 Now generate ONLY:
 ARTICLE RELEVANT_CONTENT:
@@ -346,22 +363,22 @@ ARTICLE RELEVANT_CONTENT:
 **Your Task**:
 Follow the reasoning steps below to generate a detailed and specific summary.
 
-** Step 1: Extract Parent Relevant Content
-- Extract content from the article that is relevant to the Parent Node Scope. Output as a dictionary with numbered keys.
-- For each excerpt, show ONLY the first few words and last few words, with "..." in between.
-- Merge related content into longer excerpts (avoid fragmentation).
-- Each excerpt should represent a coherent idea and be less than 10 words total (beginning + end), e.g.: {{"0": "Bilbo finds the ring ... changes his journey"}}
-- Example format: {{"0": "Darwin's health declined ... requiring attention", "1": "He married Emma ... lived together until"}}
+** Step 1: Summarize Parent-Relevant Content
+- Summarize the parts of the article that are relevant to the Parent Node Scope.
+- Use concise semantic summaries (do not rely on clipped quote fragments).
 
-** Step 2: Identify Relevant Excerpts for This Node
-- From Step 1 results, identify which items do NOT overlap with any Sibling Node Summary.
-- Output: List of keys representing non-overlapping, relevant content. Example: ["0", "2"]
+** Step 2: Decompose into Sibling Overlap vs Residual
+- Compare Step 1 summary with each Sibling Node Summary.
+- Identify:
+  1) content overlapping with siblings, and
+  2) residual content not covered by siblings.
+- If there are no sibling nodes, set SIBLING_OVERLAP_ANALYSIS = {{}} and treat all useful parent-relevant content as residual.
 
-** Step 3: Generate Summary
-- Use the selected excerpts to create a precise and focused summary.
-- The summary consists of two parts:
-    - OVERVIEW: Provide a concise description of what this node covers, based on the extracted content. (1-2 sentences)
-    - SCOPE: Define clearly what belongs to this node — focus on specificity, not generality. Exclude topics handled by siblings. (1-2 sentences)
+** Step 3: Generate New Node Summary from Residual
+- Use residual (non-overlapping) content as the core evidence for the new node.
+- The summary consists of:
+  - OVERVIEW: concise description of what this node covers. (1-2 sentences)
+  - SCOPE: explicit boundary of what belongs to this node, excluding sibling topics. (1-2 sentences)
 - The generated summary should not be general but rather focus on the details.
     - *Example Case*: Article -> This article discusses the casting process for the main character Harry in the movie Harry Potter.
         - "This node talks about the movie Harry Potter." (Incorrect)
@@ -373,8 +390,14 @@ Follow the reasoning steps below to generate a detailed and specific summary.
         - This node talks about the person's life story. (Correct)
 
 ** Output Format (STRICT):
-PARENT RELEVANT_CONTENT: {{dictionary from Step 1}}
-NON_OVERLAPPING: [list from Step 2]
+PARENT RELEVANT_CONTENT: {{
+  "PARENT_RELEVANT_SUMMARY": "string",
+  "SIBLING_OVERLAP_ANALYSIS": {{
+    "Sibling i": "overlap summary or none"
+  }},
+  "RESIDUAL_NOVEL_POINTS": ["point1", "point2"]
+}}
+NON_OVERLAPPING: [residual points from Step 2]
 OVERVIEW: [generated overview]
 SCOPE: [generated scope]
 
@@ -398,37 +421,54 @@ Now perform the analysis:
 **Your Task**:
 Follow the reasoning steps below to assess and potentially update the current node's summary.
 
-** Step 1: Extract Parent Relevant Content
-- Extract content from the new input (article or child summary) that is relevant to the Parent Node Scope. Output as a dictionary with numbered keys.
-- For each excerpt, show ONLY the first few words and last few words, with "..." in between.
-- Merge related content into coherent segments (not too fragmented).
-- Each excerpt should be less than 10 words total (beginning + end), representing a longer section.
-- Example: {{"0": "Bilbo meets Gollum ... wins the riddle game", "1": "The ring grants invisibility ... affects bearers over time"}}
+** Step 1: Summarize Parent-Relevant Content
+- Summarize content from the new input (article or child summary) that is relevant to the Parent Node Scope.
+- Use concise semantic summaries (not clipped quote snippets).
 
-** Step 2: Filter Non-Overlapping Content
-- From Step 1 results, identify which items do NOT overlap with:
-   - Any Sibling Node Summary  
-   - The Current Node Summary
-- Only when an item belongs to neither sibling nor current summary is it considered non-overlapping.
-- Output: List of keys from Step 1 that are truly new and unique to this node. Example: ["0", "2"]
+** Step 2: Decompose Overlap vs Residual
+- Compare Step 1 summary against:
+  1) the Current Node Summary, and
+  2) all Sibling Node Summaries.
+- Identify:
+  - content already covered (current/sibling overlap), and
+  - residual content not covered by either.
 
 ** Step 3: Decide Update
-- If there is at least one non-overlapping item → Output "Yes"
-- Otherwise → Output "No"
+- If esidual content contains information related to the current node's height, but the current node does not cover such content -> NEEDS_UPDATE: Yes
+- Otherwise -> NEEDS_UPDATE: No
+- *Example Case A*:
+    Article -> This article talks about a person's high school story.
+    Current Node Summary -> This node talks about the person's primary school story.
+    RESIDUAL_NOVEL_POINTS -> ["high school story"]
+    - NEEDS_UPDATE: Yes (The stories of high school and those of junior high school belong to the same category of content and are highly related.)
+- *Example Case B*:
+    Article -> This article talks about a person's family relationships.
+    Current Node Summary -> This node talks about the person's primary school story.
+    RESIDUAL_NOVEL_POINTS -> ["family relationships"]
+    - NEEDS_UPDATE: No (The content of family relationships is not related to the current node's height.)
 
-** Step 4: Generate Updated Summary (Only if Step 3 = "Yes")
-- Integrate the non-overlapping content into the existing summary.
-- The updated summary includes:
-    - OVERVIEW: Refreshed to reflect all key aspects now covered by the node, including new insights. (1-2 sentences)
-    - SCOPE: Refined to ensure boundaries remain clear and inclusive of new material, while still excluding sibling topics. (1-2 sentences)
-- Maintain precision — avoid vagueness or repetition.
-    - *Example Case*: If new info discusses “Gollum’s backstory influencing Bilbo,” then update accordingly.
-    - "This node talks about characters in The Hobbit." (Incorrect)
-    - "This node covers Bilbo’s encounter with Gollum and how it leads to acquiring the ring." (Correct)
+** Step 4: Generate Updated Summary (Only if NEEDS_UPDATE = Yes)
+- Integrate residual content into the current node summary.
+- Output:
+  - OVERVIEW: refreshed concise coverage. (1-2 sentences)
+  - SCOPE: refined node boundary including new material while excluding sibling topics. (1-2 sentences)
+- The updated summary should expand the scope based on the original summary rather than adding other theme.
+    - *Example Case*: 
+        Article -> This article talks about a person's high school story and family relationships.
+        Original Summary -> This node talks about the person's primary school story.
+        - This node talks about the person's primary school story, high school story and family relationships. (Incorrect, "family" is irrelevant with "school" and should not be included in new summary.)
+        - This node talks about the person's school story. (Correct)
 
 ** Output Format (STRICT):
-PARENT RELEVANT_CONTENT: {{dictionary from Step 1}}
-NON_OVERLAPPING: [list from Step 2]
+PARENT RELEVANT_CONTENT: {{
+  "PARENT_RELEVANT_SUMMARY": "string",
+  "CURRENT_NODE_OVERLAP": "what is already covered by current summary",
+  "SIBLING_OVERLAP_ANALYSIS": {{
+    "Sibling i": "overlap summary or none"
+  }},
+  "RESIDUAL_NOVEL_POINTS": ["point1", "point2"]
+}}
+NON_OVERLAPPING: [residual points from Step 2]
 NEEDS_UPDATE: [Yes/No]
 OVERVIEW: [if Yes]
 SCOPE: [if Yes]
@@ -504,35 +544,53 @@ Now perform the analysis:
              'relevant_content': {...}, 'non_overlapping': [...]} 或 None
         """
         try:
-            lines = response.strip().split('\n')
+            clean_response = response.strip().replace('```json', '').replace('```', '').replace('**', '')
+            lines = clean_response.split('\n')
             needs_update: Optional[bool] = None
             overview = ""
             scope = ""
             relevant_content = {}
             non_overlapping = []
             current_field: Optional[str] = None
+
+            def _parse_json_after_label(text: str, label: str):
+                pos = text.upper().find(label.upper())
+                if pos == -1:
+                    return None
+                colon = text.find(':', pos)
+                if colon == -1:
+                    return None
+                remainder = text[colon + 1:].lstrip()
+                if not remainder:
+                    return None
+                try:
+                    obj, _end = json.JSONDecoder().raw_decode(remainder)
+                    return obj
+                except Exception:
+                    return None
+
+            # 新格式下 relevant_content 可能是多行JSON，优先用整体解析
+            rc_obj = _parse_json_after_label(clean_response, 'PARENT RELEVANT_CONTENT')
+            if rc_obj is None:
+                rc_obj = _parse_json_after_label(clean_response, 'RELEVANT_CONTENT')
+            if isinstance(rc_obj, dict):
+                relevant_content = rc_obj
+
+            # NON_OVERLAPPING 也可能是完整JSON数组（字符串点列表）
+            no_obj = _parse_json_after_label(clean_response, 'NON_OVERLAPPING')
+            if isinstance(no_obj, list):
+                non_overlapping = no_obj
             
             for line in lines:
                 line_stripped = line.strip()
                 if not line_stripped:
                     continue
-                
-                line_stripped = line_stripped.replace('```json', '').replace('```', '').replace('**', '')
-                
+
+                # relevant_content/non_overlapping 已优先整体解析，这里不再按单行覆盖
                 if line_stripped.startswith('PARENT RELEVANT_CONTENT:') or line_stripped.startswith('RELEVANT_CONTENT:'):
-                    # 解析JSON字典
-                    content_str = line_stripped.split(':', 1)[1].strip()
-                    try:
-                        relevant_content = json.loads(content_str)
-                    except:
-                        relevant_content = {}
+                    continue
                 elif line_stripped.startswith('NON_OVERLAPPING:'):
-                    # 解析JSON列表
-                    overlap_str = line_stripped.split(':', 1)[1].strip()
-                    try:
-                        non_overlapping = json.loads(overlap_str)
-                    except:
-                        non_overlapping = []
+                    continue
                 elif line_stripped.startswith('NEEDS_UPDATE:'):
                     answer = line_stripped.split(':', 1)[1].strip().upper()
                     needs_update = (answer == 'YES')

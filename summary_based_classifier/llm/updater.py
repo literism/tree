@@ -9,6 +9,24 @@ import json
 import math
 import re
 from collections import Counter
+import os
+
+
+def _pick_safe_vllm_dtype(requested_dtype):
+    """Use float16 on legacy GPUs (e.g., V100) to avoid bf16 init errors."""
+    if requested_dtype is not None:
+        return requested_dtype
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return None
+        for idx in range(torch.cuda.device_count()):
+            major, _minor = torch.cuda.get_device_capability(idx)
+            if major < 8:
+                return "half"
+    except Exception:
+        return None
+    return None
 
 
 @dataclass
@@ -58,25 +76,22 @@ class Updater:
             # 支持单卡ID（int）或多卡列表字符串（如"0,1"）
             gpu_id = kwargs.get('gpu_id', 0)
             tp_size = int(kwargs.get('tensor_parallel_size', 1))
-            gpu_str = str(gpu_id)
-            if "," in gpu_str:
-                visible = [g.strip() for g in gpu_str.split(",") if g.strip()]
-                if visible:
-                    tp_size = max(tp_size, len(visible))
-            
-            # 使用Ray的方式指定GPU，避免CUDA fork问题
-            import os
-            # vLLM会使用Ray，需要在初始化前设置
-            os.environ['CUDA_VISIBLE_DEVICES'] = gpu_str
-            
-            self.llm = LLM(
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+
+            llm_kwargs = dict(
                 model=model_path,
                 tensor_parallel_size=tp_size,
                 max_model_len=kwargs.get('max_model_len', 16384),
                 gpu_memory_utilization=kwargs.get('gpu_memory_utilization', 0.9),
                 trust_remote_code=True,
                 disable_log_stats=True,  # 禁用日志统计，减少进程间通信
+                enforce_eager=True,
             )
+            safe_dtype = _pick_safe_vllm_dtype(kwargs.get('dtype'))
+            if safe_dtype is not None:
+                llm_kwargs['dtype'] = safe_dtype
+
+            self.llm = LLM(**llm_kwargs)
             
             self.sampling_params = SamplingParams(
                 temperature=kwargs.get('temperature', 0.3),
@@ -115,18 +130,22 @@ class Updater:
             
             # 获取GPU设备ID
             gpu_id = kwargs.get('gpu_id', 0)
-            
-            import os
-            os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
-            
-            self.evidence_llm = LLM(
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+
+            evidence_llm_kwargs = dict(
                 model=model_path,  # 使用传入的model_path
                 tensor_parallel_size=1,
                 max_model_len=kwargs.get('max_model_len', 8192),
                 gpu_memory_utilization=kwargs.get('gpu_memory_utilization', 0.5),
                 trust_remote_code=True,
                 disable_log_stats=True,
+                enforce_eager=True,
             )
+            safe_dtype = _pick_safe_vllm_dtype(kwargs.get('dtype'))
+            if safe_dtype is not None:
+                evidence_llm_kwargs['dtype'] = safe_dtype
+
+            self.evidence_llm = LLM(**evidence_llm_kwargs)
             
             self.evidence_sampling_params = SamplingParams(
                 temperature=0.3,
@@ -150,13 +169,58 @@ class Updater:
                 f"Siblings: {len(input_data.sibling_summaries)}\n"
                 f"NewContent: {input_data.new_content[:2000]}\n"
             )
-        return PromptTemplates.format_summary_prompt(
+        prompt = PromptTemplates.format_summary_prompt(
             topic_name=input_data.topic_name,
             node_summary=input_data.node_summary,
             parent_summary=input_data.parent_summary,
             sibling_summaries=input_data.sibling_summaries,
             new_content=input_data.new_content
         )
+        if os.environ.get("SBC_ENABLE_THINKING", "1") != "0":
+            prompt = (
+                "[Thinking Mode: ON]\n"
+                "First think carefully step by step, then output strictly in the required format.\n\n"
+                f"{prompt}"
+            )
+        return prompt
+
+    def complete_classification_prompts(
+        self,
+        prompts: List[str],
+        n: int = 1,
+        temperature: float = 0.0,
+        max_tokens: int = 2048
+    ) -> List[List[SummaryOutput]]:
+        """
+        专用于分类completion补全的推理接口。
+        不做summary结构解析，仅回传raw_response。
+        """
+        if self.mode != 'model':
+            raise ValueError("complete_classification_prompts 仅支持 model 模式")
+
+        from vllm import SamplingParams
+
+        sampling_params = SamplingParams(
+            temperature=temperature,
+            top_p=0.9,
+            max_tokens=max_tokens,
+            n=max(1, int(n)),
+        )
+        outputs = self.llm.generate(prompts, sampling_params, use_tqdm=False)
+
+        all_results: List[List[SummaryOutput]] = []
+        for output in outputs:
+            one_prompt_results: List[SummaryOutput] = []
+            for out in output.outputs:
+                one_prompt_results.append(SummaryOutput(
+                    needs_update=False,
+                    explanation="",
+                    scope="",
+                    raw_response=out.text
+                ))
+            all_results.append(one_prompt_results)
+
+        return all_results
     
     def parse_output(self, response: str) -> Optional[SummaryOutput]:
         """

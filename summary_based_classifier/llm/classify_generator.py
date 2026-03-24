@@ -7,6 +7,24 @@ from typing import List, Optional, Dict, Tuple
 from summary_based_classifier.llm.prompts import PromptTemplates
 from pathlib import Path
 import sys
+import os
+
+
+def _pick_safe_vllm_dtype(requested_dtype):
+    """Use float16 on legacy GPUs (e.g., V100) to avoid bf16 init errors."""
+    if requested_dtype is not None:
+        return requested_dtype
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return None
+        for idx in range(torch.cuda.device_count()):
+            major, _minor = torch.cuda.get_device_capability(idx)
+            if major < 8:
+                return "half"
+    except Exception:
+        return None
+    return None
 
 
 @dataclass
@@ -50,21 +68,23 @@ class ClassifyGenerator:
             
             # 获取GPU设备ID
             gpu_id = kwargs.get('gpu_id', 0)
-            
-            # 使用Ray的方式指定GPU，避免CUDA fork问题
-            import os
-            # vLLM会使用Ray，需要在初始化前设置
-            original_cuda = os.environ.get('CUDA_VISIBLE_DEVICES', '')
-            os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
-            
-            self.llm = LLM(
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+            effective_tp = int(kwargs.get('tensor_parallel_size', 1))
+
+            llm_kwargs = dict(
                 model=model_path,
-                tensor_parallel_size=1,  # 单GPU
+                tensor_parallel_size=effective_tp,
                 max_model_len=kwargs.get('max_model_len', 16384),
                 gpu_memory_utilization=kwargs.get('gpu_memory_utilization', 0.9),
                 trust_remote_code=True,
                 disable_log_stats=True,  # 禁用日志统计，减少进程间通信
+                enforce_eager=True,
             )
+            safe_dtype = _pick_safe_vllm_dtype(kwargs.get('dtype'))
+            if safe_dtype is not None:
+                llm_kwargs['dtype'] = safe_dtype
+
+            self.llm = LLM(**llm_kwargs)
             
             self.sampling_params = SamplingParams(
                 temperature=kwargs.get('temperature', 0.1),

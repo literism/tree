@@ -37,6 +37,7 @@ class ClassifierWorker:
         batch_size: int = 32,
         timeout: float = 1.0,
         gpu_id: int = 0,
+        tensor_parallel_size: int = 1,
         max_model_len: int = 16384,
         gpu_memory_utilization: float = 0.9,
         temperature: float = 0.7
@@ -49,6 +50,7 @@ class ClassifierWorker:
             batch_size: 批量大小
             timeout: 超时时间
             gpu_id: GPU ID
+            tensor_parallel_size: 张量并行大小
             max_model_len: 最大模型长度
             gpu_memory_utilization: GPU内存利用率
             temperature: 温度参数
@@ -59,6 +61,7 @@ class ClassifierWorker:
         self.batch_size = batch_size
         self.timeout = timeout
         self.gpu_id = gpu_id
+        self.tensor_parallel_size = max(1, int(tensor_parallel_size))
         self.max_model_len = max_model_len
         self.gpu_memory_utilization = gpu_memory_utilization
         self.temperature = temperature
@@ -111,6 +114,7 @@ class ClassifierWorker:
         classifier = ClassifyGenerator(
             mode='model',
             model_path=self.model_path,
+            tensor_parallel_size=self.tensor_parallel_size,
             max_model_len=self.max_model_len,
             gpu_memory_utilization=self.gpu_memory_utilization,
             temperature=self.temperature,
@@ -463,36 +467,71 @@ class UpdaterWorker:
         results = []
         
         if hasattr(updater, 'llm'):
-            # vLLM模式，批量生成
-            from vllm import SamplingParams
-            
-            sampling_params = SamplingParams(
-                temperature=contexts[0].get('temperature', 0.7) if contexts and isinstance(contexts[0], dict) else 0.7,
-                max_tokens=2048,
-                n=contexts[0].get('n', 1) if contexts and isinstance(contexts[0], dict) else 1
-            )
-            
-            outputs = updater.llm.generate(prompts, sampling_params, use_tqdm=False)
-            
-            # 解析每个输出
-            for output in outputs:
-                parsed_outputs = []
-                for out in output.outputs:
-                    response_text = out.text
-                    parsed_dict = PromptTemplates.parse_summary_output(response_text)
-                    
-                    # 转换dict为SummaryOutput对象
-                    if parsed_dict:
-                        from summary_based_classifier.llm.updater import SummaryOutput
-                        parsed_output = SummaryOutput(
-                            needs_update=parsed_dict.get('needs_update', False),
-                            explanation=parsed_dict.get('explanation', ''),
-                            scope=parsed_dict.get('scope', ''),
-                            raw_response=response_text
-                        )
-                        parsed_outputs.append(parsed_output)
-                
-                results.append(parsed_outputs)
+            # vLLM模式：根据任务类型走不同分支，避免completion受summary解析约束
+            completion_indices = []
+            summary_indices = []
+            for idx, context in enumerate(contexts):
+                task = context.get('task') if isinstance(context, dict) else None
+                if task == 'classification_completion':
+                    completion_indices.append(idx)
+                else:
+                    summary_indices.append(idx)
+
+            merged_results = [[] for _ in prompts]
+
+            # 1) 分类completion专用分支：不做summary解析，直接保留raw文本
+            if completion_indices:
+                c_prompts = [prompts[i] for i in completion_indices]
+                c_contexts = [contexts[i] for i in completion_indices]
+                c_n = c_contexts[0].get('n', 1) if c_contexts and isinstance(c_contexts[0], dict) else 1
+                c_temp = c_contexts[0].get('temperature', 0.0) if c_contexts and isinstance(c_contexts[0], dict) else 0.0
+                c_max_tokens = c_contexts[0].get('max_tokens', 2048) if c_contexts and isinstance(c_contexts[0], dict) else 2048
+
+                completion_outputs = updater.complete_classification_prompts(
+                    prompts=c_prompts,
+                    n=c_n,
+                    temperature=c_temp,
+                    max_tokens=c_max_tokens,
+                )
+                for i, parsed_outputs in zip(completion_indices, completion_outputs):
+                    merged_results[i] = parsed_outputs
+
+            # 2) 常规summary分支：保持原有解析逻辑
+            if summary_indices:
+                from vllm import SamplingParams
+
+                s_prompts = [prompts[i] for i in summary_indices]
+                s_contexts = [contexts[i] for i in summary_indices]
+                sampling_params = SamplingParams(
+                    temperature=s_contexts[0].get('temperature', 0.7) if s_contexts and isinstance(s_contexts[0], dict) else 0.7,
+                    max_tokens=2048,
+                    n=s_contexts[0].get('n', 1) if s_contexts and isinstance(s_contexts[0], dict) else 1
+                )
+
+                outputs = updater.llm.generate(s_prompts, sampling_params, use_tqdm=False)
+
+                summary_results = []
+                for output in outputs:
+                    parsed_outputs = []
+                    for out in output.outputs:
+                        response_text = out.text
+                        parsed_dict = PromptTemplates.parse_summary_output(response_text)
+
+                        if parsed_dict:
+                            from summary_based_classifier.llm.updater import SummaryOutput
+                            parsed_output = SummaryOutput(
+                                needs_update=parsed_dict.get('needs_update', False),
+                                explanation=parsed_dict.get('explanation', ''),
+                                scope=parsed_dict.get('scope', ''),
+                                raw_response=response_text
+                            )
+                            parsed_outputs.append(parsed_output)
+                    summary_results.append(parsed_outputs)
+
+                for i, parsed_outputs in zip(summary_indices, summary_results):
+                    merged_results[i] = parsed_outputs
+
+            results = merged_results
         
         else:
             # API模式，逐个调用
