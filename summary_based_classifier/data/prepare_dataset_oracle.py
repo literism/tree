@@ -221,7 +221,41 @@ class OracleSFTGenerator:
         if not text:
             return {}
 
-        # 优先解析 label 后的JSON（支持多行JSON）
+        def _strip_code_fence(s: str) -> str:
+            s = s.strip()
+            if s.startswith("```"):
+                lines = s.splitlines()
+                if lines and lines[0].strip().startswith("```"):
+                    lines = lines[1:]
+                if lines and lines[-1].strip().startswith("```"):
+                    lines = lines[:-1]
+                s = "\n".join(lines).strip()
+            return s
+
+        def _decode_first_json_obj(s: str):
+            s = _strip_code_fence(s).lstrip()
+            if not s:
+                return None
+            decoder = json.JSONDecoder()
+            # 1) 先尝试从开头直接解
+            try:
+                obj, _ = decoder.raw_decode(s)
+                if isinstance(obj, dict):
+                    return obj
+            except Exception:
+                pass
+            # 2) 再从首个'{'开始解（支持前置说明文本）
+            brace = s.find("{")
+            if brace != -1:
+                try:
+                    obj, _ = decoder.raw_decode(s[brace:])
+                    if isinstance(obj, dict):
+                        return obj
+                except Exception:
+                    pass
+            return None
+
+        # 优先解析 label 后的 JSON（支持多行、嵌套 JSON）
         up = text.upper()
         pos = up.find("ARTICLE RELEVANT_CONTENT:")
         if pos != -1:
@@ -229,22 +263,14 @@ class OracleSFTGenerator:
             if colon != -1:
                 remainder = text[colon + 1:].lstrip()
                 if remainder:
-                    try:
-                        obj, _end = json.JSONDecoder().raw_decode(remainder)
-                        if isinstance(obj, dict):
-                            return obj
-                    except Exception:
-                        pass
+                    obj = _decode_first_json_obj(remainder)
+                    if isinstance(obj, dict):
+                        return obj
 
-        # 回退：提取第一个JSON对象
-        m = re.search(r"\{[\s\S]*?\}", text)
-        if m:
-            try:
-                obj = json.loads(m.group(0))
-                if isinstance(obj, dict):
-                    return obj
-            except Exception:
-                return {}
+        # 回退：从全文中解析首个完整 JSON 对象（避免正则截断嵌套结构）
+        obj = _decode_first_json_obj(text)
+        if isinstance(obj, dict):
+            return obj
         return {}
 
     @staticmethod

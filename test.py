@@ -18,20 +18,19 @@ import json
 #     # input()
 # print(a, b / len(dataset), c, len(dataset))
 
-with open('/mnt/literism/tree/summary_output/data/oracle_data_model/classification_train.jsonl', 'r') as f:
+with open('/Users/literism/Desktop/lab/tree/classification_train.jsonl', 'r') as f:
     lines = f.readlines()
 
 a = b = c = 0
-for i, line in enumerate(lines):
+start = 3000
+for i, line in enumerate(lines[start:]):
     data = json.loads(line)
-    output_json = json.loads(data['completion'])
-    if i == 2000:
-        pass
-    if output_json['selected_indices']:
-        a += 1
-    if output_json['need_new']:
-        b += 1
-    if output_json['merge_with']:
-        c += 1
+    prompt = data['prompt']
+    completion = data['completion']
+    print(prompt)
+    print('=' * 50)
+    print('=' * 50)
+    print(completion)
+    input()
 
 print(a, b, c, len(lines))
