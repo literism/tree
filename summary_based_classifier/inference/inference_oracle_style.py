@@ -22,6 +22,7 @@ def main():
     parser.add_argument('--updater_api_model', type=str, default='deepseek-chat', help='API模型名（updater_mode=api）')
     parser.add_argument('--updater_api_max_output_tokens', type=int, default=2048, help='API最大输出tokens')
     parser.add_argument('--updater_api_max_concurrent_jobs', type=int, default=8, help='API并发数')
+    parser.add_argument('--tau_merge', type=float, default=None, help='merge阈值；若为空则使用config.inference.tau_merge')
     parser.add_argument('--split', type=str, default='test', help='推理的数据划分')
     parser.add_argument('--max_refs', type=int, default=None, help='每个topic最多处理的文章数')
     parser.add_argument('--max_workers', type=int, default=4, help='最大并行topic数')
@@ -131,7 +132,8 @@ def main():
         top_p=config.inference.top_p,
         max_workers=args.max_workers,
         max_content_length=config.summary.max_content_length,
-        tokenizer_name=tokenizer_name
+        tokenizer_name=tokenizer_name,
+        tau_merge=args.tau_merge if args.tau_merge is not None else getattr(config.inference, 'tau_merge', 0.2),
     )
     
     # 执行并行推理

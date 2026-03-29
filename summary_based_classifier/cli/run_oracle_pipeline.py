@@ -205,6 +205,12 @@ def main():
         default=1,
         help='推理时最大并行topic数（默认4）'
     )
+    parser.add_argument(
+        '--inference_tau_merge',
+        type=float,
+        default=None,
+        help='推理merge阈值（单阈值）；为空则使用config.inference.tau_merge'
+    )
     
     args = parser.parse_args()
     
@@ -530,6 +536,8 @@ def main():
         
         if args.max_refs_per_topic:
             cmd.extend(['--max_refs', str(args.max_refs_per_topic)])
+        if args.inference_tau_merge is not None:
+            cmd.extend(['--tau_merge', str(args.inference_tau_merge)])
         
         run_command(cmd, "步骤4: Oracle风格推理（分类模型 + 总结模型）", cwd=str(project_root))
         

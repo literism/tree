@@ -45,7 +45,8 @@ class OracleStyleInferenceProcessor:
         top_p: float = 1.0,
         max_workers: int = 4,
         max_content_length: int = 4000,
-        tokenizer_name: str = "base_model"
+        tokenizer_name: str = "base_model",
+        tau_merge: float = 0.2,
     ):
         """
         Args:
@@ -67,10 +68,12 @@ class OracleStyleInferenceProcessor:
             max_workers: 最大并行topic数
             max_content_length: 文章最大token长度
             tokenizer_name: tokenizer名称
+            tau_merge: merge阈值，使用 score=p(best_non_null)-p(null)
         """
         self.max_depth = max_depth
         self.max_workers = max_workers
         self.max_content_length = max_content_length
+        self.tau_merge = float(tau_merge)
         self.updater_mode = updater_mode
         self.updater_worker = None
         self.updater_prompt_queue = None
@@ -173,6 +176,68 @@ class OracleStyleInferenceProcessor:
             raise ValueError(f"不支持的updater_mode: {self.updater_mode}")
 
         print(f"  ✓ Worker进程已启动")
+
+    @staticmethod
+    def _parse_category_index(category_key: str, num_children: int) -> Optional[int]:
+        key = str(category_key).strip().lower()
+        if key.startswith("category"):
+            try:
+                idx = int(key.split()[-1])
+                if 0 <= idx < num_children:
+                    return idx
+            except Exception:
+                return None
+        if key.isdigit() or (key.startswith("-") and key[1:].isdigit()):
+            idx = int(key)
+            if 0 <= idx < num_children:
+                return idx
+        return None
+
+    def _decide_merge_with_threshold(
+        self,
+        classification_output,
+        num_children: int,
+        article_id: str,
+        node_depth: int,
+    ) -> Optional[int]:
+        """
+        使用单阈值tau_merge决定是否执行merge。
+        score = p(best_non_null) - p(null)，若score >= tau_merge则merge到best_non_null。
+        """
+        if not getattr(classification_output, "need_new", False):
+            return None
+
+        probs = getattr(classification_output, "merge_candidate_probs", {}) or {}
+        if not isinstance(probs, dict) or not probs:
+            # 回退到模型原始MERGE_WITH输出（兼容旧模型/旧数据）
+            return getattr(classification_output, "merge_with", None)
+
+        p_null = float(probs.get("null", 0.0))
+        best_idx = None
+        best_prob = -1.0
+        for k, v in probs.items():
+            idx = self._parse_category_index(k, num_children)
+            if idx is None:
+                continue
+            try:
+                p = float(v)
+            except Exception:
+                continue
+            if p > best_prob:
+                best_prob = p
+                best_idx = idx
+
+        if best_idx is None:
+            return None
+
+        score = best_prob - p_null
+        final_merge = best_idx if score >= self.tau_merge else None
+        print(
+            f"[merge-threshold] article={article_id} depth={node_depth} "
+            f"best=Category {best_idx} p_best={best_prob:.4f} p_null={p_null:.4f} "
+            f"score={score:.4f} tau={self.tau_merge:.4f} -> merge_with={final_merge}"
+        )
+        return final_merge
     
     def truncate_text(self, text: str) -> str:
         """根据token数截断文本"""
@@ -310,7 +375,8 @@ class OracleStyleInferenceProcessor:
         article_content: str,
         parent_summary: str,
         current_summary: str,
-        sibling_summaries: List[str]
+        sibling_summaries: List[str],
+        new_node_direction: Optional[Dict] = None,
     ) -> Optional[str]:
         """
         使用总结模型生成/更新summary
@@ -324,7 +390,8 @@ class OracleStyleInferenceProcessor:
             node_summary=current_summary,
             parent_summary=parent_summary if parent_summary else topic_name,
             sibling_summaries=sibling_summaries,
-            new_content=article_content
+            new_content=article_content,
+            new_node_direction=(new_node_direction if not current_summary else None),
         )
         prompt = self._apply_thinking_mode(prompt)
         
@@ -437,6 +504,12 @@ class OracleStyleInferenceProcessor:
             # 1. 处理创建新节点（如果need_new=True）
             new_node = None
             if classification_output.need_new:
+                decided_merge_idx = self._decide_merge_with_threshold(
+                    classification_output=classification_output,
+                    num_children=len(cur_node.children),
+                    article_id=article_id,
+                    node_depth=cur_node.depth,
+                )
                 # 创建新节点
                 sibling_summaries = []
                 if cur_node.parent:
@@ -447,7 +520,8 @@ class OracleStyleInferenceProcessor:
                     article_content=article_content,
                     parent_summary=cur_parent_summary,
                     current_summary="",
-                    sibling_summaries=sibling_summaries
+                    sibling_summaries=sibling_summaries,
+                    new_node_direction=getattr(classification_output, 'new_node_direction', {}) or {},
                 )
                 
                 if not new_summary:
@@ -463,8 +537,8 @@ class OracleStyleInferenceProcessor:
                 cur_node.children.append(new_node)
                 
                 # 处理归拢（如果需要）
-                if classification_output.merge_with is not None:
-                    merge_idx = classification_output.merge_with
+                if decided_merge_idx is not None:
+                    merge_idx = decided_merge_idx
                     if isinstance(merge_idx, int) and 0 <= merge_idx < len(cur_node.children) - 1:
                         # 收集要归拢的节点（新节点 + 1个指定已有节点）
                         nodes_to_merge = [new_node, cur_node.children[merge_idx]]

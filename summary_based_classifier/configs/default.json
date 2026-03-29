@@ -1,10 +1,10 @@
 {
   "path": {
-    "structures_file": "/ossfs/workspace/tree/data/tree/data/wikipedia_structures_final.json",
-    "references_file": "/ossfs/workspace/tree/data/wikipedia_references_final.json",
-    "output_base": "/ossfs/workspace/tree/data/",
-    "data_dir": "/ossfs/workspace/tree/data/",
-    "base_model": "/home/admin/Qwen3-32B"
+    "structures_file": "/Users/literism/Desktop/lab/tree/data/wikipedia_structures_final.json",
+    "references_file": "/Users/literism/Desktop/lab/tree/data/wikipedia_references_final.json",
+    "output_base": "/Users/literism/Desktop/lab/tree/data/",
+    "data_dir": "/Users/literism/Desktop/lab/tree/data/",
+    "base_model": "/Users/literism/Desktop/lab/Qwen-4B"
   },
   "data_split": {
     "target_test_size": 250,
@@ -78,7 +78,8 @@
     "top_p": 1,
     "max_tokens": 16384,
     "max_parallel_topics": 10,
-    "similarity_threshold": 0.85
+    "similarity_threshold": 0.85,
+    "tau_merge": 0.2
   },
   "dpo_training": {
     "start_iteration": 0,
