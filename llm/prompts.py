@@ -41,21 +41,42 @@ class PromptTemplates:
 - If residual forms a coherent and specific uncovered theme -> NEED_NEW = true  
 - Otherwise -> NEED_NEW = false
 
-** Step 5: Assess Need for Merge  
-- Evaluate whether a newly created category (if any) should be merged with one existing child category.  
+** Step 5: Specify New Node Direction (if NEED_NEW=true)  
+- Explicitly define what the new node should focus on, and what it should exclude.  
+- This direction will be passed to the summary generator for new-node creation.
+
+** Step 6: Analyze Merge Signal from Residual  
+- Based on residual (non-overlapping) content and the new-node direction, analyze whether the new category is still highly related to one existing child category.  
+- Provide concise evidence and counter-evidence instead of only giving a hard decision.  
+- Keep this analysis short, specific, and category-aware.
+
+** Step 7: Assess Need for Merge  
+- Use Step 6 merge analysis to decide whether a newly created category should be merged with one existing child category.  
 - Output: single index to merge into, or null.
 
 **Output Format** (STRICT):
-ARTICLE RELEVANT_CONTENT: {{
+ARTICLE_RELEVANT_CONTENT: {{
   "PARENT_RELEVANT_SUMMARY": "string",
   "CHILD_OVERLAP_ANALYSIS": {{
     "Category i": "overlap summary or none"
   }},
   "RESIDUAL_NOVEL_POINTS": ["point1", "point2"]
 }}
+NEW_NODE_DIRECTION: {{
+  "core_focus": "one-sentence direction for the new node",
+  "in_scope_points": ["point1", "point2"],
+  "out_of_scope_points": ["point1", "point2"],
+  "anchor_terms": ["term1", "term2"]
+}}
+MERGE_SIGNAL: {{
+  "highly_related_categories": ["Category i"],
+  "evidence_for_merge": "short reason",
+  "evidence_against_merge": "short reason",
+  "merge_strength": 0.0
+}}
 MATCHED_CATEGORIES: [list from Step 3]
 NEED_NEW: [true/false from Step 4]
-MERGE_WITH: [int/null from Step 5]
+MERGE_WITH: [int/null from Step 7]
 
 ## Input Content for Processing:
 **Topic**: {topic_name}
@@ -121,6 +142,130 @@ Now classify the article:
             clean_response = response.strip().replace("```json", "").replace("```", "").strip()
             lines = [ln.strip() for ln in clean_response.splitlines() if ln.strip()]
 
+            def _parse_json_after_label(text: str, label: str):
+                up_text = text.upper()
+                target = f"{label.upper()}:"
+                pos = up_text.find(target)
+                if pos == -1:
+                    return None
+                colon = text.find(":", pos)
+                if colon == -1:
+                    return None
+                remainder = text[colon + 1:].lstrip()
+                if not remainder:
+                    return None
+                try:
+                    obj, _ = json.JSONDecoder().raw_decode(remainder)
+                    return obj
+                except Exception:
+                    return None
+
+            def _parse_json_after_any_label(text: str, labels: List[str]):
+                for lb in labels:
+                    obj = _parse_json_after_label(text, lb)
+                    if isinstance(obj, dict):
+                        return obj
+                return {}
+
+            def _normalize_merge_candidate_probs(raw_probs: Optional[Dict], n_cats: int) -> Dict[str, float]:
+                if not isinstance(raw_probs, dict):
+                    return {}
+                normalized: Dict[str, float] = {}
+                for k, v in raw_probs.items():
+                    try:
+                        prob = float(v)
+                    except Exception:
+                        continue
+                    prob = max(0.0, min(1.0, prob))
+                    key = str(k).strip()
+                    low = key.lower()
+                    if low in {"null", "none"}:
+                        normalized["null"] = prob
+                        continue
+                    idx = None
+                    if low.startswith("category"):
+                        m = re.search(r"-?\d+", low)
+                        if m:
+                            idx = int(m.group(0))
+                    elif low.isdigit() or (low.startswith("-") and low[1:].isdigit()):
+                        idx = int(low)
+                    if idx is not None and 0 <= idx < n_cats:
+                        normalized[f"Category {idx}"] = prob
+                if not normalized:
+                    return {}
+                total = sum(normalized.values())
+                if total > 0:
+                    normalized = {k: v / total for k, v in normalized.items()}
+                return normalized
+
+            def _extract_merge_candidate_probs(
+                merge_signal_obj: Optional[Dict],
+                merge_with_idx: Optional[int],
+                n_cats: int
+            ) -> Dict[str, float]:
+                if not isinstance(merge_signal_obj, dict):
+                    return {}
+
+                # 兼容旧格式：直接读取candidate_probs
+                probs = _normalize_merge_candidate_probs(merge_signal_obj.get("candidate_probs"), n_cats)
+                if probs:
+                    return probs
+
+                # 新格式：用单一merge_strength构造可阈值化的二项分布
+                raw_strength = merge_signal_obj.get("merge_strength")
+                if raw_strength is None:
+                    return {}
+                try:
+                    strength = float(raw_strength)
+                except Exception:
+                    return {}
+                strength = max(0.0, min(1.0, strength))
+
+                candidate_idx = merge_with_idx
+                if candidate_idx is None:
+                    raw_candidates = merge_signal_obj.get("highly_related_categories", [])
+                    if isinstance(raw_candidates, list):
+                        for c in raw_candidates:
+                            key = str(c).strip().lower()
+                            idx = None
+                            if key.startswith("category"):
+                                m = re.search(r"-?\d+", key)
+                                if m:
+                                    idx = int(m.group(0))
+                            elif key.isdigit() or (key.startswith("-") and key[1:].isdigit()):
+                                idx = int(key)
+                            if idx is not None and 0 <= idx < n_cats:
+                                candidate_idx = idx
+                                break
+
+                if isinstance(candidate_idx, int) and 0 <= candidate_idx < n_cats:
+                    return {
+                        f"Category {candidate_idx}": strength,
+                        "null": 1.0 - strength,
+                    }
+                return {"null": 1.0}
+
+            article_relevant_content = _parse_json_after_any_label(
+                clean_response,
+                ["ARTICLE_RELEVANT_CONTENT", "ARTICLE RELEVANT_CONTENT"],
+            )
+            new_node_direction = _parse_json_after_any_label(
+                clean_response,
+                ["NEW_NODE_DIRECTION", "NEW NODE DIRECTION"],
+            )
+            merge_signal = _parse_json_after_any_label(
+                clean_response,
+                ["MERGE_SIGNAL", "MERGE SIGNAL"],
+            )
+
+            # 兼容旧格式：MERGE_SIGNAL可能写在ARTICLE_RELEVANT_CONTENT内部
+            if not merge_signal and isinstance(article_relevant_content, dict):
+                nested = article_relevant_content.get("MERGE_SIGNAL")
+                if isinstance(nested, dict):
+                    merge_signal = nested
+
+            merge_candidate_probs: Dict[str, float] = {}
+
             # 1) 优先解析当前prompt约定的四行格式
             if any("MATCHED_CATEGORIES:" in ln for ln in lines) and any("NEED_NEW:" in ln for ln in lines):
                 matched_line = None
@@ -180,10 +325,21 @@ Now classify the article:
                         else:
                             return None
 
+                if isinstance(merge_signal, dict):
+                    merge_candidate_probs = _extract_merge_candidate_probs(
+                        merge_signal_obj=merge_signal,
+                        merge_with_idx=merge_with,
+                        n_cats=num_categories,
+                    )
+
                 return {
                     "selected_indices": selected_indices,
                     "need_new": need_new,
                     "merge_with": merge_with,
+                    "article_relevant_content": article_relevant_content,
+                    "new_node_direction": new_node_direction if isinstance(new_node_direction, dict) else {},
+                    "merge_signal": merge_signal if isinstance(merge_signal, dict) else {},
+                    "merge_candidate_probs": merge_candidate_probs,
                 }
 
             # 2) 回退解析旧JSON格式
@@ -261,26 +417,43 @@ Now classify the article:
             if raw_merge is not None:
                 if isinstance(raw_merge, str) and raw_merge.strip().lower() in {"none", "null", ""}:
                     raw_merge = None
-                    return {
-                        'selected_indices': selected_indices,
-                        'need_new': need_new,
-                        'merge_with': None
-                    }
                 if isinstance(raw_merge, bool):
                     return None
-                try:
-                    merge_idx = int(raw_merge)
-                except (TypeError, ValueError):
-                    return None
-                if 0 <= merge_idx < num_categories:
-                    merge_with = merge_idx
-                else:
-                    return None
+                if raw_merge is not None:
+                    try:
+                        merge_idx = int(raw_merge)
+                    except (TypeError, ValueError):
+                        return None
+                    if 0 <= merge_idx < num_categories:
+                        merge_with = merge_idx
+                    else:
+                        return None
+
+            article_relevant_content = parsed_obj.get("article_relevant_content", parsed_obj.get("ARTICLE_RELEVANT_CONTENT", {}))
+            if not isinstance(article_relevant_content, dict):
+                article_relevant_content = {}
+            new_node_direction = parsed_obj.get("new_node_direction", parsed_obj.get("NEW_NODE_DIRECTION", {}))
+            if not isinstance(new_node_direction, dict):
+                new_node_direction = {}
+            merge_signal = parsed_obj.get("merge_signal", parsed_obj.get("MERGE_SIGNAL", {}))
+            if not isinstance(merge_signal, dict):
+                merge_signal = article_relevant_content.get("MERGE_SIGNAL", {})
+            merge_candidate_probs = {}
+            if isinstance(merge_signal, dict):
+                merge_candidate_probs = _extract_merge_candidate_probs(
+                    merge_signal_obj=merge_signal,
+                    merge_with_idx=merge_with,
+                    n_cats=num_categories,
+                )
 
             return {
                 'selected_indices': selected_indices,
                 'need_new': need_new,
-                'merge_with': merge_with
+                'merge_with': merge_with,
+                'article_relevant_content': article_relevant_content,
+                'new_node_direction': new_node_direction,
+                'merge_signal': merge_signal if isinstance(merge_signal, dict) else {},
+                'merge_candidate_probs': merge_candidate_probs,
             }
         except Exception as e:
             print(f"解析分类输出失败: {e}, response: {response}")
@@ -292,7 +465,9 @@ Now classify the article:
         need_new: bool,
         num_categories: int,
         merge_with: Optional[int] = None,
-        relevant_content: Optional[Dict] = None
+        relevant_content: Optional[Dict] = None,
+        new_node_direction: Optional[Dict] = None,
+        merge_signal: Optional[Dict] = None,
     ) -> str:
         """
         格式化分类系统completion（当前四行格式）
@@ -301,9 +476,15 @@ Now classify the article:
         valid_merge = merge_with if (merge_with is not None and 0 <= merge_with < num_categories) else None
         if not isinstance(relevant_content, dict):
             relevant_content = {}
+        if not isinstance(new_node_direction, dict):
+            new_node_direction = {}
+        if not isinstance(merge_signal, dict):
+            merge_signal = {}
 
         return (
-            f"ARTICLE RELEVANT_CONTENT: {json.dumps(relevant_content, ensure_ascii=False)}\n"
+            f"ARTICLE_RELEVANT_CONTENT: {json.dumps(relevant_content, ensure_ascii=False)}\n"
+            f"NEW_NODE_DIRECTION: {json.dumps(new_node_direction, ensure_ascii=False)}\n"
+            f"MERGE_SIGNAL: {json.dumps(merge_signal, ensure_ascii=False)}\n"
             f"MATCHED_CATEGORIES: {json.dumps(valid_selected, ensure_ascii=False)}\n"
             f"NEED_NEW: {'true' if bool(need_new) else 'false'}\n"
             f"MERGE_WITH: {('null' if valid_merge is None else str(valid_merge))}"
@@ -315,30 +496,53 @@ Now classify the article:
         matched_categories: List[int],
         need_new: bool,
         merge_with: Optional[int],
+        first_uncovered_path: Optional[List[str]] = None,
     ) -> str:
         """构造“基于Oracle结果补充推理”的数据生成prompt"""
-        return f"""You are reconstructing missing training data for a hierarchical classifier. Your task is to generate only the missing "ARTICLE RELEVANT_CONTENT" dictionary that is logically consistent with the given Oracle final decisions.
+        oracle_path_text = "null"
+        if first_uncovered_path:
+            oracle_path_text = json.dumps([str(x) for x in first_uncovered_path], ensure_ascii=False)
+
+        return f"""You are reconstructing missing training data for a hierarchical classifier. Your task is to generate missing structured fields that are logically consistent with the given Oracle final decisions.
 
 **Important**:
 - Do NOT output chain-of-thought.
 - Do NOT output MATCHED_CATEGORIES / NEED_NEW / MERGE_WITH.
 - Do NOT output any extra text.
-- Output ONLY one dictionary for ARTICLE RELEVANT_CONTENT.
+- Output ONLY the following three dictionaries: ARTICLE_RELEVANT_CONTENT, NEW_NODE_DIRECTION, MERGE_SIGNAL.
 
-**Target Dictionary Schema**:
+**Target Dictionary Schemas**:
+{{
+ARTICLE_RELEVANT_CONTENT:
 {{
   "PARENT_RELEVANT_SUMMARY": "string",
   "CHILD_OVERLAP_ANALYSIS": {{
     "Category i": "overlap summary or none"
   }},
   "RESIDUAL_NOVEL_POINTS": ["point1", "point2"]
+}},
+NEW_NODE_DIRECTION:
+{{
+  "core_focus": "one-sentence direction for the new node",
+  "in_scope_points": ["point1", "point2"],
+  "out_of_scope_points": ["point1", "point2"],
+  "anchor_terms": ["term1", "term2"]
+}},
+MERGE_SIGNAL:
+{{
+  "highly_related_categories": ["Category i"],
+  "evidence_for_merge": "short reason",
+  "evidence_against_merge": "short reason",
+  "merge_strength": 0.0
+}}
 }}
 
 **Answer-Guided Constraints (MUST satisfy)**:
-1. The dictionary must support EXACTLY these Oracle outputs:
+1. The three dictionaries must support EXACTLY these Oracle outputs:
    - MATCHED_CATEGORIES: {json.dumps(sorted(set(matched_categories)), ensure_ascii=False)}
    - NEED_NEW: {"true" if bool(need_new) else "false"}
    - MERGE_WITH: {"null" if merge_with is None else merge_with}
+   - ORACLE_FIRST_UNCOVERED_PATH: {oracle_path_text}
 2. CHILD_OVERLAP_ANALYSIS:
    - Categories in MATCHED_CATEGORIES must have clear overlap evidence.
    - Categories NOT in MATCHED_CATEGORIES should be weak overlap or none.
@@ -346,7 +550,17 @@ Now classify the article:
 3. RESIDUAL_NOVEL_POINTS:
    - If NEED_NEW = true, include concrete residual points not covered by matched categories.
    - If NEED_NEW = false, residual points should be empty or clearly non-decisive.
-4. Keep content concise, semantic, and classification-oriented (no long quoted excerpts).
+4. NEW_NODE_DIRECTION requirements:
+   - If NEED_NEW = true, provide specific direction for the newly created node.
+   - If NEED_NEW = true, core_focus / in_scope_points must be semantically aligned with ORACLE_FIRST_UNCOVERED_PATH.
+   - If NEED_NEW = false, NEW_NODE_DIRECTION can be empty or conservative.
+5. Keep content concise, semantic, and classification-oriented (no long quoted excerpts).
+6. MERGE_SIGNAL requirements:
+   - Provide concise merge rationale (for/against) based on residual content.
+   - highly_related_categories should include plausible merge candidates (can be empty).
+   - merge_strength should be in [0,1] and reflect overall merge confidence.
+   - If NEED_NEW = false, merge_strength should usually be low.
+   - If MERGE_WITH is not null in Oracle outputs, merge rationale should support that category.
 
 Classification task prompt:
 ==================================
@@ -354,7 +568,9 @@ Classification task prompt:
 ==================================
 
 Now generate ONLY:
-ARTICLE RELEVANT_CONTENT:
+ARTICLE_RELEVANT_CONTENT:
+NEW_NODE_DIRECTION:
+MERGE_SIGNAL:
 """
     
     # ==================== 总结系统Prompt ====================
@@ -376,9 +592,11 @@ Follow the reasoning steps below to generate a detailed and specific summary.
 
 ** Step 3: Generate New Node Summary from Residual
 - Use residual (non-overlapping) content as the core evidence for the new node.
+- Use the provided "New Node Direction" as hard guidance for what to include/exclude.
 - The summary consists of:
   - OVERVIEW: concise description of what this node covers. (1-2 sentences)
   - SCOPE: explicit boundary of what belongs to this node, excluding sibling topics. (1-2 sentences)
+- The generated summary must align with the direction's core_focus and in_scope_points, and avoid out_of_scope_points.
 - The generated summary should not be general but rather focus on the details.
     - *Example Case*: Article -> This article discusses the casting process for the main character Harry in the movie Harry Potter.
         - "This node talks about the movie Harry Potter." (Incorrect)
@@ -409,6 +627,9 @@ Parent Node Summary:
 
 Sibling Node Summaries:
 {siblings_text}
+
+New Node Direction (from classifier):
+{new_node_direction_text}
 
 Article:
 {new_content}
@@ -498,7 +719,8 @@ Now perform the analysis:
         parent_summary: str,
         sibling_summaries: List[str],
         new_content: str,
-        target_label: str = None
+        target_label: str = None,
+        new_node_direction: Optional[Dict] = None,
     ) -> str:
         """格式化总结系统prompt"""
         # 构建兄弟节点列表
@@ -516,6 +738,11 @@ Now perform the analysis:
         # 如果parent_summary为空，使用topic_name
         if not parent_summary:
             parent_summary = topic_name
+
+        if isinstance(new_node_direction, dict) and new_node_direction:
+            new_node_direction_text = json.dumps(new_node_direction, ensure_ascii=False)
+        else:
+            new_node_direction_text = "None"
         
         is_generate = not (node_summary and str(node_summary).strip())
         if is_generate:
@@ -523,6 +750,7 @@ Now perform the analysis:
                 topic_name=topic_name,
                 parent_summary=parent_summary,
                 siblings_text=siblings_text,
+                new_node_direction_text=new_node_direction_text,
                 new_content=new_content,
             )
 

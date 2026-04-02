@@ -148,6 +148,7 @@ class InferenceConfig:
     
     # Summary去重配置
     similarity_threshold: float = 0.85  # 相似度阈值，超过则认为是重复
+    tau_merge: float = 0.2  # merge阈值：score=p(best_non_null)-p(null)
 
 
 @dataclass

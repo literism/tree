@@ -213,39 +213,92 @@ class OracleSFTGenerator:
         except Exception as e:
             raise RuntimeError(f"API客户端初始化失败或不可用: {e}") from e
 
-    def _extract_article_relevant_content(self, completion_text: str) -> Dict:
-        """从模型输出中提取 ARTICLE RELEVANT_CONTENT 字典。"""
+    def _extract_json_after_labels(
+        self,
+        completion_text: str,
+        labels: List[str],
+        allow_global_fallback: bool = False,
+    ) -> Dict:
+        """从模型输出中按标签提取JSON字典（支持多行、嵌套、代码块）。"""
         if not isinstance(completion_text, str):
             return {}
         text = completion_text.strip()
         if not text:
             return {}
 
-        # 优先解析 label 后的JSON（支持多行JSON）
-        up = text.upper()
-        pos = up.find("ARTICLE RELEVANT_CONTENT:")
-        if pos != -1:
-            colon = text.find(":", pos)
-            if colon != -1:
-                remainder = text[colon + 1:].lstrip()
-                if remainder:
-                    try:
-                        obj, _end = json.JSONDecoder().raw_decode(remainder)
-                        if isinstance(obj, dict):
-                            return obj
-                    except Exception:
-                        pass
+        def _strip_code_fence(s: str) -> str:
+            s = s.strip()
+            if s.startswith("```"):
+                lines = s.splitlines()
+                if lines and lines[0].strip().startswith("```"):
+                    lines = lines[1:]
+                if lines and lines[-1].strip().startswith("```"):
+                    lines = lines[:-1]
+                s = "\n".join(lines).strip()
+            return s
 
-        # 回退：提取第一个JSON对象
-        m = re.search(r"\{[\s\S]*?\}", text)
-        if m:
+        def _decode_first_json_obj(s: str):
+            s = _strip_code_fence(s).lstrip()
+            if not s:
+                return None
+            decoder = json.JSONDecoder()
+            # 1) 先尝试从开头直接解
             try:
-                obj = json.loads(m.group(0))
+                obj, _ = decoder.raw_decode(s)
                 if isinstance(obj, dict):
                     return obj
             except Exception:
-                return {}
+                pass
+            # 2) 再从首个'{'开始解（支持前置说明文本）
+            brace = s.find("{")
+            if brace != -1:
+                try:
+                    obj, _ = decoder.raw_decode(s[brace:])
+                    if isinstance(obj, dict):
+                        return obj
+                except Exception:
+                    pass
+            return None
+
+        # 优先解析 label 后的 JSON（支持多行、嵌套 JSON）
+        up = text.upper()
+        for label in labels:
+            tag = f"{label.upper()}:"
+            pos = up.find(tag)
+            if pos != -1:
+                colon = text.find(":", pos)
+                if colon != -1:
+                    remainder = text[colon + 1:].lstrip()
+                    if remainder:
+                        obj = _decode_first_json_obj(remainder)
+                        if isinstance(obj, dict):
+                            return obj
+
+        # 可选回退：从全文中解析首个完整 JSON 对象（避免正则截断嵌套结构）
+        if allow_global_fallback:
+            obj = _decode_first_json_obj(text)
+            if isinstance(obj, dict):
+                return obj
         return {}
+
+    def _extract_article_relevant_content(self, completion_text: str) -> Dict:
+        return self._extract_json_after_labels(
+            completion_text,
+            ["ARTICLE_RELEVANT_CONTENT", "ARTICLE RELEVANT_CONTENT"],
+            allow_global_fallback=True,
+        )
+
+    def _extract_new_node_direction(self, completion_text: str) -> Dict:
+        return self._extract_json_after_labels(
+            completion_text,
+            ["NEW_NODE_DIRECTION", "NEW NODE DIRECTION"],
+        )
+
+    def _extract_merge_signal(self, completion_text: str) -> Dict:
+        return self._extract_json_after_labels(
+            completion_text,
+            ["MERGE_SIGNAL", "MERGE SIGNAL"],
+        )
 
     @staticmethod
     def _apply_thinking_mode(prompt: str) -> str:
@@ -267,9 +320,10 @@ class OracleSFTGenerator:
         selected_indices: List[int],
         need_new: bool,
         merge_with_idx: Optional[int],
-        num_categories: int
-    ) -> str:
-        """根据策略π结果补充 Step1 字段，并输出当前四行completion。"""
+        num_categories: int,
+        first_uncovered_path: Optional[Sequence[str]] = None,
+    ) -> Tuple[str, Dict]:
+        """根据策略π结果补充结构化字段，并输出completion与提取结果。"""
         valid_selected = sorted(set(i for i in selected_indices if 0 <= i < num_categories))
         valid_merge = merge_with_idx if (merge_with_idx is not None and 0 <= merge_with_idx < num_categories) else None
         reasoning_prompt = self.prompt_templates.format_classification_reasoning_prompt(
@@ -277,17 +331,53 @@ class OracleSFTGenerator:
             matched_categories=valid_selected,
             need_new=need_new,
             merge_with=valid_merge,
+            first_uncovered_path=(list(first_uncovered_path) if first_uncovered_path else None),
         )
         completion_from_model = self.generate_classification_completion(reasoning_prompt)
         relevant_content = self._extract_article_relevant_content(completion_from_model)
+        new_node_direction = self._extract_new_node_direction(completion_from_model)
+        merge_signal = self._extract_merge_signal(completion_from_model)
+        
+        # 兼容一种常见输出：模型把三段字段包在一个外层JSON里。
+        # 例如：
+        # ARTICLE_RELEVANT_CONTENT: {
+        #   "ARTICLE_RELEVANT_CONTENT": {...},
+        #   "NEW_NODE_DIRECTION": {...},
+        #   "MERGE_SIGNAL": {...}
+        # }
+        # 这里做结构化拆包，避免 NEW_NODE_DIRECTION 被误判为空。
+        if isinstance(relevant_content, dict):
+            wrapper_arc = relevant_content.get("ARTICLE_RELEVANT_CONTENT")
+            wrapper_nd = relevant_content.get("NEW_NODE_DIRECTION")
+            wrapper_ms = relevant_content.get("MERGE_SIGNAL")
+            has_wrapper = any(isinstance(x, dict) for x in [wrapper_arc, wrapper_nd, wrapper_ms])
+            if has_wrapper:
+                if isinstance(wrapper_arc, dict):
+                    relevant_content = wrapper_arc
+                if (not new_node_direction) and isinstance(wrapper_nd, dict):
+                    new_node_direction = wrapper_nd
+                if (not merge_signal) and isinstance(wrapper_ms, dict):
+                    merge_signal = wrapper_ms
 
-        return self.prompt_templates.format_classification_completion(
+        if not merge_signal and isinstance(relevant_content, dict):
+            nested = relevant_content.get("MERGE_SIGNAL")
+            if isinstance(nested, dict):
+                merge_signal = nested
+
+        completion = self.prompt_templates.format_classification_completion(
             selected_indices=valid_selected,
             need_new=need_new,
             num_categories=num_categories,
             merge_with=valid_merge,
             relevant_content=relevant_content,
+            new_node_direction=new_node_direction,
+            merge_signal=merge_signal,
         )
+        return completion, {
+            "article_relevant_content": relevant_content,
+            "new_node_direction": new_node_direction,
+            "merge_signal": merge_signal,
+        }
 
     def generate_classification_completion(self, prompt: str, max_retries: int = 3) -> str:
         """
@@ -519,7 +609,15 @@ class OracleSFTGenerator:
                 # 解析失败，停止传递
                 break
     
-    def generate_summary_for_node(self, node: TreeNode, article: str, topic: str, article_idx: int, is_new_node: bool = False):
+    def generate_summary_for_node(
+        self,
+        node: TreeNode,
+        article: str,
+        topic: str,
+        article_idx: int,
+        is_new_node: bool = False,
+        new_node_direction: Optional[Dict] = None,
+    ):
         """
         为节点生成/更新summary
         同时记录summary生成的训练数据
@@ -545,7 +643,8 @@ class OracleSFTGenerator:
             parent_summary=parent_summary,
             sibling_summaries=sibling_summaries,
             new_content=truncated_article,
-            target_label=None  # 基础prompt不包含guidance
+            target_label=None,  # 基础prompt不包含guidance
+            new_node_direction=(new_node_direction if is_new_node else None),
         )
         
         # 在生成数据时，额外添加guidance给API（不记录到训练数据中）
@@ -852,15 +951,17 @@ class OracleSFTGenerator:
                         break
 
                 all_selected = list(child_to_paths.keys())
-                self._record_classification_sample(
+                extracted_fields = self._record_classification_sample(
                     current_node=cur_node,
                     article=article,
                     topic=topic,
                     article_idx=article_idx,
                     selected_indices=all_selected,
                     need_new=True,
-                    merge_with_idx=merge_idx
+                    merge_with_idx=merge_idx,
+                    first_uncovered_path=first_uncovered_path,
                 )
+                new_node_direction = extracted_fields.get("new_node_direction", {}) if isinstance(extracted_fields, dict) else {}
                 
                 # 创建新叶子
                 new_leaf = TreeNode(summary="", citations=[], children=[])
@@ -886,7 +987,14 @@ class OracleSFTGenerator:
                 new_leaf.citations.append(ref_id)
                 
                 # 为新节点生成初始summary（直接生成，不判断是否需要更新）
-                self.generate_summary_for_node(new_leaf, article, topic, article_idx, is_new_node=True)
+                self.generate_summary_for_node(
+                    new_leaf,
+                    article,
+                    topic,
+                    article_idx,
+                    is_new_node=True,
+                    new_node_direction=new_node_direction,
+                )
                 
                 # 新节点创建后，从父节点开始向上传递更新
                 # 因为新节点的内容会影响其父节点的summary
@@ -958,7 +1066,8 @@ class OracleSFTGenerator:
                     article_idx=article_idx,
                     selected_indices=all_selected,
                     need_new=False,
-                    merge_with_idx=None
+                    merge_with_idx=None,
+                    first_uncovered_path=None,
                 )
                 
                 with self.stats_lock:
@@ -1005,8 +1114,9 @@ class OracleSFTGenerator:
         article_idx: int,
         selected_indices: List[int],
         need_new: bool,
-        merge_with_idx: Optional[int]
-    ):
+        merge_with_idx: Optional[int],
+        first_uncovered_path: Optional[Sequence[str]] = None,
+    ) -> Dict:
         """记录分类训练样本（支持多分类）"""
         # 根据token数截断文章（分类用较短的）
         truncated_article = self.truncate_text(article, max_tokens=1000)
@@ -1022,12 +1132,13 @@ class OracleSFTGenerator:
         )
         
         # 构造completion（推理 + JSON），JSON由Oracle结果固定
-        completion = self._build_classification_completion_with_reasoning(
+        completion, extracted_fields = self._build_classification_completion_with_reasoning(
             classification_prompt=prompt,
             selected_indices=selected_indices,
             need_new=need_new,
             merge_with_idx=merge_with_idx,
             num_categories=len(current_node.children),
+            first_uncovered_path=first_uncovered_path,
         )
         
         # 创建样本
@@ -1047,6 +1158,7 @@ class OracleSFTGenerator:
             if self.progress_bar:
                 with self.progress_lock:
                     self.progress_bar.update(1)
+        return extracted_fields
     
     def _process_single_topic(self, topic_key: str, ref_ids: List[str], thread_id: int = 0) -> Dict:
         """处理单个topic（线程函数）"""
@@ -1350,7 +1462,7 @@ def main():
     parser.add_argument('--api_model', type=str, default='deepseek-chat', help='API模型名称（API模式）')
     parser.add_argument('--temperature', type=float, default=0.1, help='生成温度')
     parser.add_argument('--max_output_tokens', type=int, default=4096, help='最大输出tokens（API模式）')
-    parser.add_argument('--max_concurrent_jobs', type=int, default=1, help='API并发数（API模式）')
+    parser.add_argument('--max_concurrent_jobs', type=int, default=16, help='API并发数（API模式）')
     
     # 模型模式参数
     parser.add_argument('--summary_model_path', type=str, default=None, help='总结模型路径（模型模式，默认使用config中的base_model）')
@@ -1359,7 +1471,7 @@ def main():
     
     # 通用参数
     parser.add_argument('--max_topics', type=int, default=None, help='最多处理的topic数量')
-    parser.add_argument('--num_workers', type=int, default=1, help='并行线程数')
+    parser.add_argument('--num_workers', type=int, default=16, help='并行线程数')
     parser.add_argument('--max_samples_per_type', type=int, default=5000, help='每种类型的最大样本数（达到后退出）')
     parser.add_argument('--output_dir', type=str, default=None, help='输出目录')
     

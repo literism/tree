@@ -250,6 +250,8 @@ class ClassifierWorker:
                             selected_indices=parsed_dict['selected_indices'],
                             need_new=parsed_dict['need_new'],
                             merge_with=parsed_dict.get('merge_with'),
+                            new_node_direction=parsed_dict.get('new_node_direction', {}) or {},
+                            merge_candidate_probs=parsed_dict.get('merge_candidate_probs', {}) or {},
                             raw_response=response_text
                         )
                         parsed_outputs.append(parsed_output)

@@ -48,6 +48,8 @@ class ClassificationOutput:
     need_new: bool  # 是否需要新类
     raw_response: str  # 原始响应（用于计算log概率）
     merge_with: Optional[int] = None  # 当need_new=True时，是否与某个现有类别归拢（InsertParentPath）；None表示不归拢
+    new_node_direction: Dict = field(default_factory=dict)  # 新类方向（用于指导新节点summary生成）
+    merge_candidate_probs: Dict[str, float] = field(default_factory=dict)  # MERGE_WITH候选概率（含null）
 
 
 class ClassifyGenerator:
@@ -136,6 +138,8 @@ class ClassifyGenerator:
             selected_indices=parsed['selected_indices'],
             need_new=parsed['need_new'],
             merge_with=parsed.get('merge_with'),
+            new_node_direction=parsed.get('new_node_direction', {}) or {},
+            merge_candidate_probs=parsed.get('merge_candidate_probs', {}) or {},
             raw_response=response
         )
     
