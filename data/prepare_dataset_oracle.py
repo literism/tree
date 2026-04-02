@@ -1462,7 +1462,7 @@ def main():
     parser.add_argument('--api_model', type=str, default='deepseek-chat', help='API模型名称（API模式）')
     parser.add_argument('--temperature', type=float, default=0.1, help='生成温度')
     parser.add_argument('--max_output_tokens', type=int, default=4096, help='最大输出tokens（API模式）')
-    parser.add_argument('--max_concurrent_jobs', type=int, default=16, help='API并发数（API模式）')
+    parser.add_argument('--max_concurrent_jobs', type=int, default=8, help='API并发数（API模式）')
     
     # 模型模式参数
     parser.add_argument('--summary_model_path', type=str, default=None, help='总结模型路径（模型模式，默认使用config中的base_model）')
@@ -1471,7 +1471,7 @@ def main():
     
     # 通用参数
     parser.add_argument('--max_topics', type=int, default=None, help='最多处理的topic数量')
-    parser.add_argument('--num_workers', type=int, default=16, help='并行线程数')
+    parser.add_argument('--num_workers', type=int, default=8, help='并行线程数')
     parser.add_argument('--max_samples_per_type', type=int, default=5000, help='每种类型的最大样本数（达到后退出）')
     parser.add_argument('--output_dir', type=str, default=None, help='输出目录')
     
